@@ -395,6 +395,15 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub mux_enable_ssh_agent: bool,
 
+    /// When set to false, wezterm-gui will not spawn a local mux server.
+    /// This can help avoid crashes on Windows when stale socket files exist
+    /// from previous crashed sessions.
+    /// The mux server is used for inter-process communication between
+    /// wezterm instances. Disabling it means you lose the ability to
+    /// use `wezterm cli` commands to interact with running instances.
+    #[dynamic(default = "default_true")]
+    pub enable_mux_server: bool,
+
     #[dynamic(default)]
     pub default_ssh_auth_sock: Option<String>,
 

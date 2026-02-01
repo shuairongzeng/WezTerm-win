@@ -309,6 +309,7 @@ fn read_from_pane_pty(
 
     std::thread::spawn({
         let dead = Arc::clone(&dead);
+        let pane = pane.clone();
         move || parse_buffered_data(pane, &dead, rx)
     });
 
@@ -330,6 +331,41 @@ fn read_from_pane_pty(
                 histogram!("read_from_pane_pty.bytes.rate").record(size as f64);
                 log::trace!("read_pty pane {pane_id} read {size} bytes");
                 if let Err(err) = tx.write_all(&buf[..size]) {
+                    // On Windows, socket connections can be abruptly reset.
+                    // Check if this is a transient Windows socket error.
+                    #[cfg(windows)]
+                    {
+                        if let Some(code) = err.raw_os_error() {
+                            // 10053 = WSAECONNABORTED, 10054 = WSAECONNRESET
+                            if code == 10053 || code == 10054 {
+                                log::warn!(
+                                    "read_pty transient socket error for pane {}: os error {}, attempting to recover",
+                                    pane_id, code
+                                );
+                                // Try to reallocate the socketpair and parser thread
+                                match allocate_socketpair() {
+                                    Ok((new_tx, new_rx)) => {
+                                        tx = new_tx;
+                                        // Spawn a new parser thread with the new rx
+                                        let pane_clone = pane.clone();
+                                        let dead_clone = Arc::clone(&dead);
+                                        std::thread::spawn(move || {
+                                            parse_buffered_data(pane_clone, &dead_clone, new_rx)
+                                        });
+                                        log::info!("read_pty recovered from socket error for pane {}", pane_id);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "read_pty failed to recover socketpair for pane {}: {:?}",
+                                            pane_id, e
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     error!(
                         "read_pty failed to write to parser: pane {} {:?}",
                         pane_id, err

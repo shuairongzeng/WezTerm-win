@@ -78,6 +78,25 @@ where
                                 // Client disconnected: no need to make a noise
                                 return Ok(());
                             }
+                            // Windows: handle connection reset errors (WSAECONNRESET = 10054)
+                            // and connection aborted errors (WSAECONNABORTED = 10053)
+                            #[cfg(windows)]
+                            {
+                                if let Some(code) = err.raw_os_error() {
+                                    if code == 10054 || code == 10053 {
+                                        // Client disconnected abruptly: no need to make a noise
+                                        log::trace!("Client connection reset (os error {})", code);
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            // Also handle ConnectionReset and ConnectionAborted error kinds
+                            if err.kind() == std::io::ErrorKind::ConnectionReset
+                                || err.kind() == std::io::ErrorKind::ConnectionAborted
+                            {
+                                log::trace!("Client connection reset: {:?}", err.kind());
+                                return Ok(());
+                            }
                         }
                         return Err(err).context("reading Pdu from client");
                     }
@@ -91,6 +110,25 @@ where
                         if let Some(err) = err.root_cause().downcast_ref::<std::io::Error>() {
                             if err.kind() == std::io::ErrorKind::BrokenPipe {
                                 // Client disconnected: no need to make a noise
+                                return Ok(());
+                            }
+                            // Windows: handle connection reset errors (WSAECONNRESET = 10054)
+                            // and connection aborted errors (WSAECONNABORTED = 10053)
+                            #[cfg(windows)]
+                            {
+                                if let Some(code) = err.raw_os_error() {
+                                    if code == 10054 || code == 10053 {
+                                        // Client disconnected abruptly: no need to make a noise
+                                        log::trace!("Client connection reset while writing (os error {})", code);
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            // Also handle ConnectionReset and ConnectionAborted error kinds
+                            if err.kind() == std::io::ErrorKind::ConnectionReset
+                                || err.kind() == std::io::ErrorKind::ConnectionAborted
+                            {
+                                log::trace!("Client connection reset while writing: {:?}", err.kind());
                                 return Ok(());
                             }
                         }

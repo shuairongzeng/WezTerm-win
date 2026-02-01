@@ -416,8 +416,18 @@ async fn async_run_terminal_gui(
     wezterm_blob_leases::register_storage(Arc::new(
         wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(&*config::CACHE_DIR)?,
     ))?;
-    if let Err(err) = spawn_mux_server(unix_socket_path, should_publish) {
-        log::warn!("{:#}", err);
+
+    // Only spawn mux server if enabled in config
+    let config = config::configuration();
+    if config.enable_mux_server {
+        // Clean up stale socket files from crashed processes before starting
+        cleanup_stale_socket_files();
+
+        if let Err(err) = spawn_mux_server(unix_socket_path, should_publish) {
+            log::warn!("{:#}", err);
+        }
+    } else {
+        log::info!("Mux server disabled via enable_mux_server = false");
     }
 
     if !opts.no_auto_connect {
@@ -644,6 +654,68 @@ impl Publish {
             }
         } else {
             Ok(false)
+        }
+    }
+}
+
+/// Clean up stale socket files from crashed wezterm processes.
+/// On Windows, stale socket files can cause connection errors that lead to crashes.
+fn cleanup_stale_socket_files() {
+    let runtime_dir = &*config::RUNTIME_DIR;
+
+    // Get current process ID
+    let current_pid = unsafe { libc::getpid() };
+
+    if let Ok(entries) = std::fs::read_dir(runtime_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                // Match socket files with pattern "gui-sock-{pid}"
+                if name.starts_with("gui-sock-") {
+                    if let Some(pid_str) = name.strip_prefix("gui-sock-") {
+                        if let Ok(pid) = pid_str.parse::<i32>() {
+                            // Don't remove our own socket
+                            if pid == current_pid {
+                                continue;
+                            }
+
+                            // Check if the process is still running
+                            #[cfg(windows)]
+                            {
+                                use winapi::um::processthreadsapi::OpenProcess;
+                                use winapi::um::handleapi::CloseHandle;
+                                use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+
+                                let handle = unsafe {
+                                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32)
+                                };
+
+                                if handle.is_null() {
+                                    // Process doesn't exist, remove stale socket file
+                                    log::info!("Removing stale socket file: {:?} (process {} no longer exists)", path, pid);
+                                    if let Err(e) = std::fs::remove_file(&path) {
+                                        log::debug!("Failed to remove stale socket file {:?}: {}", path, e);
+                                    }
+                                } else {
+                                    unsafe { CloseHandle(handle) };
+                                }
+                            }
+
+                            #[cfg(unix)]
+                            {
+                                // On Unix, use kill(0) to check if process exists
+                                if unsafe { libc::kill(pid, 0) } != 0 {
+                                    // Process doesn't exist
+                                    log::info!("Removing stale socket file: {:?} (process {} no longer exists)", path, pid);
+                                    if let Err(e) = std::fs::remove_file(&path) {
+                                        log::debug!("Failed to remove stale socket file {:?}: {}", path, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
