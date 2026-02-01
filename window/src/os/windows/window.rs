@@ -1110,6 +1110,11 @@ unsafe fn wm_ncdestroy(
     _wparam: WPARAM,
     _lparam: LPARAM,
 ) -> Option<LRESULT> {
+    // Release mouse capture if this window has it, to prevent stuck capture state
+    if GetCapture() == hwnd {
+        ReleaseCapture();
+    }
+
     let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as LPVOID;
     if !raw.is_null() {
         let inner = take_rc_from_pointer(raw);

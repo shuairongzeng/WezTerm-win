@@ -10,7 +10,7 @@ use winapi::shared::minwindef::DWORD;
 use winapi::um::minwinbase::STILL_ACTIVE;
 use winapi::um::processthreadsapi::*;
 use winapi::um::synchapi::WaitForSingleObject;
-use winapi::um::winbase::INFINITE;
+use winapi::um::winbase::{INFINITE, WAIT_FAILED};
 
 pub mod conpty;
 mod procthreadattr;
@@ -38,6 +38,10 @@ impl WinChild {
                 Ok(Some(ExitStatus::with_exit_code(status)))
             }
         } else {
+            // Log the error but return None to allow retry
+            // This can happen if the process handle becomes invalid
+            let err = IoError::last_os_error();
+            log::warn!("GetExitCodeProcess failed: {:?}", err);
             Ok(None)
         }
     }
@@ -98,8 +102,10 @@ impl Child for WinChild {
             return Ok(status);
         }
         let proc = self.proc.lock().unwrap().try_clone().unwrap();
-        unsafe {
-            WaitForSingleObject(proc.as_raw_handle() as _, INFINITE);
+        let wait_result = unsafe { WaitForSingleObject(proc.as_raw_handle() as _, INFINITE) };
+        // Check if WaitForSingleObject failed
+        if wait_result == WAIT_FAILED {
+            return Err(IoError::last_os_error());
         }
         let mut status: DWORD = 0;
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
@@ -144,8 +150,9 @@ impl std::future::Future for WinChild {
 
                     let waker = cx.waker().clone();
                     std::thread::spawn(move || {
-                        unsafe {
-                            WaitForSingleObject(handle.0 as _, INFINITE);
+                        let result = unsafe { WaitForSingleObject(handle.0 as _, INFINITE) };
+                        if result == WAIT_FAILED {
+                            log::warn!("WaitForSingleObject failed in poll(): {:?}", IoError::last_os_error());
                         }
                         waker.wake();
                     });

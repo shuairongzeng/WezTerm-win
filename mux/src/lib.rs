@@ -263,12 +263,14 @@ fn set_socket_buffer(fd: &mut FileDescriptor, option: i32, size: usize) -> anyho
 
 fn allocate_socketpair() -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
     let (mut tx, mut rx) = socketpair().context("socketpair")?;
-    set_socket_buffer(&mut tx, SO_SNDBUF, BUFSIZE)
-        .context("SO_SNDBUF")
-        .ok();
-    set_socket_buffer(&mut rx, SO_RCVBUF, BUFSIZE)
-        .context("SO_RCVBUF")
-        .ok();
+    // Log warnings instead of silently ignoring socket buffer errors
+    // On Windows, large buffer sizes may not be supported
+    if let Err(e) = set_socket_buffer(&mut tx, SO_SNDBUF, BUFSIZE).context("SO_SNDBUF") {
+        log::warn!("Failed to set socket send buffer size: {:#}", e);
+    }
+    if let Err(e) = set_socket_buffer(&mut rx, SO_RCVBUF, BUFSIZE).context("SO_RCVBUF") {
+        log::warn!("Failed to set socket receive buffer size: {:#}", e);
+    }
     Ok((tx, rx))
 }
 

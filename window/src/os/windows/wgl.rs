@@ -190,11 +190,17 @@ impl GlState {
                             ({}), fall back to basic",
                             err
                         );
+                        // Release the HDC before falling back to basic context
+                        // which will acquire its own HDC
+                        unsafe { ReleaseDC(window, hdc) };
                         let wgl = WglWrapper::load()?;
                         Self::create_basic(wgl, window)
                     }
                 };
             }
+            // If WGL_ARB_pixel_format extension is not available,
+            // release HDC before falling back to basic context
+            unsafe { ReleaseDC(window, hdc) };
         }
 
         Self::create_basic(wgl, window)

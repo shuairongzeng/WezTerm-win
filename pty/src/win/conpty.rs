@@ -14,11 +14,13 @@ impl PtySystem for ConPtySystem {
         let stdin = Pipe::new()?;
         let stdout = Pipe::new()?;
 
+        // Clamp terminal size to valid i16 range (1..=32767)
+        // Windows COORD uses i16, so values > 32767 would overflow
+        let cols = size.cols.clamp(1, i16::MAX as u16) as i16;
+        let rows = size.rows.clamp(1, i16::MAX as u16) as i16;
+
         let con = PsuedoCon::new(
-            COORD {
-                X: size.cols as i16,
-                Y: size.rows as i16,
-            },
+            COORD { X: cols, Y: rows },
             stdin.read,
             stdout.write,
         )?;
@@ -58,10 +60,11 @@ impl Inner {
         pixel_width: u16,
         pixel_height: u16,
     ) -> Result<(), Error> {
-        self.con.resize(COORD {
-            X: num_cols as i16,
-            Y: num_rows as i16,
-        })?;
+        // Clamp terminal size to valid i16 range (1..=32767)
+        let cols = num_cols.clamp(1, i16::MAX as u16) as i16;
+        let rows = num_rows.clamp(1, i16::MAX as u16) as i16;
+
+        self.con.resize(COORD { X: cols, Y: rows })?;
         self.size = PtySize {
             rows: num_rows,
             cols: num_cols,
