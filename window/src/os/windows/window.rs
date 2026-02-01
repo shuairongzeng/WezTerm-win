@@ -73,24 +73,24 @@ extern "system" {
 
 lazy_static! {
     static ref IS_WIN10: bool = {
-        let osver = OSVERSIONINFOW {
+        let mut osver = OSVERSIONINFOW {
             dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as _,
             ..Default::default()
         };
 
-        if unsafe { GetVersionExW(&osver as *const _ as _) } == winapi::shared::minwindef::TRUE {
+        if unsafe { GetVersionExW(&mut osver as *mut _ as _) } == winapi::shared::minwindef::TRUE {
             osver.dwBuildNumber < 22000
         } else {
             true
         }
     };
     static ref IS_WIN11_22H2: bool = {
-        let osver = OSVERSIONINFOW {
+        let mut osver = OSVERSIONINFOW {
             dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as _,
             ..Default::default()
         };
 
-        if unsafe { GetVersionExW(&osver as *const _ as _) } == winapi::shared::minwindef::TRUE {
+        if unsafe { GetVersionExW(&mut osver as *mut _ as _) } == winapi::shared::minwindef::TRUE {
             osver.dwBuildNumber >= 22621
         } else {
             true

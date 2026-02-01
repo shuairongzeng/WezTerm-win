@@ -117,9 +117,32 @@ impl SpawnQueue {
 
     fn run_impl(&self) -> bool {
         self.event_handle.reset_event();
+
+        // Process spawn queue with a time budget to prevent UI freeze.
+        // Previously, Windows processed ALL queued items before returning to
+        // the message loop, which blocked WM_PAINT and caused UI unresponsiveness
+        // during heavy terminal output. Now we limit processing time to ensure
+        // the message pump can handle UI events.
+        const MAX_PROCESS_TIME_MS: u128 = 8; // ~8ms budget per iteration (~120fps worth)
+        const MAX_ITEMS_PER_RUN: usize = 50; // Also limit by count as a safeguard
+
+        let start = Instant::now();
+        let mut processed = 0;
+
         while let Some(func) = self.pop_func() {
             func();
+            processed += 1;
+
+            // Check if we've exceeded our time or count budget
+            if processed >= MAX_ITEMS_PER_RUN || start.elapsed().as_millis() >= MAX_PROCESS_TIME_MS {
+                // Re-signal the event so we'll be called again soon
+                if self.has_any_queued() {
+                    self.event_handle.set_event();
+                }
+                break;
+            }
         }
+
         self.has_any_queued()
     }
 }

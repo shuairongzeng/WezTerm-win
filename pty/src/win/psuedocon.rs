@@ -10,6 +10,7 @@ use std::io::Error as IoError;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use std::{mem, ptr};
 use winapi::shared::minwindef::DWORD;
@@ -170,6 +171,7 @@ impl PsuedoCon {
 
         Ok(WinChild {
             proc: Mutex::new(proc),
+            waiter_spawned: AtomicBool::new(false),
         })
     }
 }

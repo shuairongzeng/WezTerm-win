@@ -3,6 +3,7 @@ use anyhow::Context as _;
 use std::io::{Error as IoError, Result as IoResult};
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 use winapi::shared::minwindef::DWORD;
@@ -20,6 +21,9 @@ use filedescriptor::OwnedHandle;
 #[derive(Debug)]
 pub struct WinChild {
     proc: Mutex<OwnedHandle>,
+    /// Tracks whether a waiter thread has been spawned to avoid thread accumulation.
+    /// Once a waiter thread is spawned, subsequent poll() calls should not spawn more.
+    waiter_spawned: AtomicBool,
 }
 
 impl WinChild {
@@ -41,9 +45,9 @@ impl WinChild {
     fn do_kill(&mut self) -> IoResult<()> {
         let proc = self.proc.lock().unwrap().try_clone().unwrap();
         let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
-        let err = IoError::last_os_error();
-        if res != 0 {
-            Err(err)
+        // TerminateProcess returns non-zero on SUCCESS, zero on FAILURE
+        if res == 0 {
+            Err(IoError::last_os_error())
         } else {
             Ok(())
         }
@@ -70,9 +74,9 @@ pub struct WinChildKiller {
 impl ChildKiller for WinChildKiller {
     fn kill(&mut self) -> IoResult<()> {
         let res = unsafe { TerminateProcess(self.proc.as_raw_handle() as _, 1) };
-        let err = IoError::last_os_error();
-        if res != 0 {
-            Err(err)
+        // TerminateProcess returns non-zero on SUCCESS, zero on FAILURE
+        if res == 0 {
+            Err(IoError::last_os_error())
         } else {
             Ok(())
         }
@@ -129,19 +133,23 @@ impl std::future::Future for WinChild {
             Ok(Some(status)) => Poll::Ready(Ok(status)),
             Err(err) => Poll::Ready(Err(err).context("Failed to retrieve process exit status")),
             Ok(None) => {
-                struct PassRawHandleToWaiterThread(pub RawHandle);
-                unsafe impl Send for PassRawHandleToWaiterThread {}
+                // Only spawn a waiter thread if one hasn't been spawned yet.
+                // This prevents thread accumulation when poll() is called multiple times.
+                if !self.waiter_spawned.swap(true, Ordering::SeqCst) {
+                    struct PassRawHandleToWaiterThread(pub RawHandle);
+                    unsafe impl Send for PassRawHandleToWaiterThread {}
 
-                let proc = self.proc.lock().unwrap().try_clone()?;
-                let handle = PassRawHandleToWaiterThread(proc.as_raw_handle());
+                    let proc = self.proc.lock().unwrap().try_clone()?;
+                    let handle = PassRawHandleToWaiterThread(proc.as_raw_handle());
 
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    unsafe {
-                        WaitForSingleObject(handle.0 as _, INFINITE);
-                    }
-                    waker.wake();
-                });
+                    let waker = cx.waker().clone();
+                    std::thread::spawn(move || {
+                        unsafe {
+                            WaitForSingleObject(handle.0 as _, INFINITE);
+                        }
+                        waker.wake();
+                    });
+                }
                 Poll::Pending
             }
         }

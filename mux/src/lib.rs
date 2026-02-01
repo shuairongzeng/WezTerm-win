@@ -285,7 +285,9 @@ fn read_from_pane_pty(
 
     // This is used to signal that an error occurred either in this thread,
     // or in the main mux thread.  If `true`, this thread will terminate.
-    let dead = Arc::new(AtomicBool::new(false));
+    // On Windows, this may be replaced with a new Arc when recovering from
+    // socket errors, so it needs to be mutable.
+    let mut dead = Arc::new(AtomicBool::new(false));
 
     let (pane_id, exit_behavior) = match pane.upgrade() {
         Some(pane) => (pane.pane_id(), pane.exit_behavior()),
@@ -346,7 +348,13 @@ fn read_from_pane_pty(
                                 match allocate_socketpair() {
                                     Ok((new_tx, new_rx)) => {
                                         tx = new_tx;
-                                        // Spawn a new parser thread with the new rx
+                                        // Create a NEW dead flag for the new parser thread.
+                                        // The old parser thread will exit when its rx becomes invalid,
+                                        // and it will set the OLD dead flag. We don't want that to
+                                        // affect our new parser thread, so we create a fresh flag.
+                                        let new_dead = Arc::new(AtomicBool::new(false));
+                                        dead = new_dead;
+                                        // Spawn a new parser thread with the new rx and new dead flag
                                         let pane_clone = pane.clone();
                                         let dead_clone = Arc::clone(&dead);
                                         std::thread::spawn(move || {
