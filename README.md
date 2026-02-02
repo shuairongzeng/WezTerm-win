@@ -8,6 +8,34 @@ User facing docs and guide at: https://wezterm.org/
 
 *Screenshot of wezterm on macOS, running vim*
 
+## ⚡ Fork Notice: Windows Stability Improvements
+
+This is a fork of WezTerm with **critical Windows stability fixes**, especially for heavy terminal output scenarios (e.g., running AI coding assistants like Claude Code, Codex, etc.).
+
+### Key Fixes in This Fork
+
+| Issue | Fix |
+|-------|-----|
+| **Input blocking during heavy output** | Added input priority mechanism with `AtomicBool` flag. When keyboard input is pending, `perform_actions` yields immediately to prevent input starvation. |
+| **PTY connection errors (10053/10054)** | Added retry mechanism for transient socket errors. Panes no longer crash on temporary connection issues. |
+| **Windows message pump freeze** | Added 500ms stuck detection with automatic recovery. UI no longer freezes during heavy rendering. |
+| **Terminal lock contention** | Reduced batch size and added periodic yields during output processing. |
+
+### Download
+
+Download pre-built Windows binaries from [Releases](https://github.com/shuairongzeng/WezTerm-win/releases).
+
+### Why This Fork?
+
+The upstream WezTerm has issues on Windows where:
+- Keyboard input becomes unresponsive when there's heavy terminal output
+- Panes can freeze or crash with socket error 10053
+- The UI may become unresponsive during rapid output
+
+This fork has been tested with **90+ minutes of continuous AI output** without any input blocking issues.
+
+---
+
 ## Installation
 
 https://wezterm.org/installation
