@@ -460,17 +460,20 @@ impl ThreadedWriter {
             while let Ok(msg) = receiver.recv() {
                 match msg {
                     WriterMessage::Data(buf) => {
-                        if writer.write(&buf).is_err() {
+                        if let Err(e) = writer.write(&buf) {
+                            log::warn!("ThreadedWriter: write failed: {:?}, stopping writer thread", e);
                             break;
                         }
                     }
                     WriterMessage::Flush => {
-                        if writer.flush().is_err() {
+                        if let Err(e) = writer.flush() {
+                            log::warn!("ThreadedWriter: flush failed: {:?}, stopping writer thread", e);
                             break;
                         }
                     }
                 }
             }
+            log::info!("ThreadedWriter: writer thread exiting");
         });
 
         Self { sender }

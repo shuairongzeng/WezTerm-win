@@ -126,6 +126,8 @@ pub(crate) struct WindowInner {
 
     config: ConfigHandle,
     paint_throttled: bool,
+    /// Timestamp when paint_throttled was set to true
+    paint_throttled_at: Option<std::time::Instant>,
     invalidated: bool,
 }
 
@@ -546,6 +548,7 @@ impl Window {
             maximize_button_position: None,
             config: config.clone(),
             paint_throttled: false,
+            paint_throttled_at: None,
             invalidated: true,
         }));
 
@@ -1617,9 +1620,22 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
 
+    // Check if paint is throttled, but add a safety timeout to prevent stuck state.
+    // If paint_throttled has been true for more than 500ms, force reset it.
+    // This protects against the async timer/callback failing to reset the flag.
     if inner.paint_throttled {
-        inner.invalidated = true;
-        return Some(0);
+        let should_force_reset = inner.paint_throttled_at
+            .map(|at| at.elapsed() > std::time::Duration::from_millis(500))
+            .unwrap_or(false);
+
+        if should_force_reset {
+            log::warn!("wm_paint: paint_throttled stuck for >500ms, forcing reset");
+            inner.paint_throttled = false;
+            inner.paint_throttled_at = None;
+        } else {
+            inner.invalidated = true;
+            return Some(0);
+        }
     }
 
     let mut ps = PAINTSTRUCT {
@@ -1644,12 +1660,16 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     inner.events.dispatch(WindowEvent::NeedRepaint);
 
     inner.paint_throttled = true;
+    inner.paint_throttled_at = Some(std::time::Instant::now());
     let window_id = inner.hwnd;
     let max_fps = inner.config.max_fps;
     promise::spawn::spawn(async move {
         async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64)).await;
+        // Reset paint throttle - if this fails (window closed), the safety timeout
+        // in wm_paint will handle it
         Connection::with_window_inner(window_id, move |inner| {
             inner.paint_throttled = false;
+            inner.paint_throttled_at = None;
             if inner.invalidated {
                 InvalidateRect(inner.hwnd.0, null(), 0);
             }

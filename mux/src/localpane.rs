@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::escape::csi::{Sgr, CSI};
@@ -133,6 +134,11 @@ pub struct LocalPane {
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
+    /// Flag indicating there's pending input waiting for the terminal lock.
+    /// When set, perform_actions should yield quickly to allow input processing.
+    input_pending: AtomicBool,
+    /// Counter for pending input operations to handle multiple concurrent inputs.
+    input_wait_count: AtomicUsize,
 }
 
 #[async_trait(?Send)]
@@ -388,30 +394,100 @@ impl Pane for LocalPane {
     }
 
     fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
-        self.terminal.lock().perform_actions(actions)
+        // Process actions in batches to avoid holding the terminal lock for too long.
+        // This prevents input (key_down) from being blocked when there's heavy output.
+        // We use input_pending flag to detect when input is waiting and yield immediately.
+        const BATCH_SIZE: usize = 50;
+        const MAX_CONSECUTIVE_BATCHES: usize = 3;
+
+        if actions.is_empty() {
+            return;
+        }
+
+        if actions.len() <= BATCH_SIZE {
+            // Small batch, process directly but still check for pending input
+            if self.input_pending.load(Ordering::Acquire) {
+                // Input is waiting, yield first
+                std::thread::yield_now();
+            }
+            self.terminal.lock().perform_actions(actions);
+        } else {
+            // Large batch, process in chunks with input priority checks
+            let mut consecutive_batches = 0;
+            for chunk in actions.chunks(BATCH_SIZE) {
+                // Check if input is pending before acquiring lock
+                if self.input_pending.load(Ordering::Acquire) {
+                    // Input is waiting - yield aggressively to let it proceed
+                    std::thread::yield_now();
+                    std::thread::sleep(Duration::from_micros(100));
+                    consecutive_batches = 0;
+                }
+
+                self.terminal.lock().perform_actions(chunk.to_vec());
+                consecutive_batches += 1;
+
+                // After processing some batches, yield to prevent starvation
+                if consecutive_batches >= MAX_CONSECUTIVE_BATCHES {
+                    std::thread::yield_now();
+                    consecutive_batches = 0;
+                }
+            }
+        }
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
-        self.terminal.lock().mouse_event(event)
+        // Signal that input is pending
+        self.input_pending.store(true, Ordering::Release);
+        self.input_wait_count.fetch_add(1, Ordering::AcqRel);
+
+        let result = self.terminal.lock().mouse_event(event);
+
+        // Clear pending flag if no more waiters
+        if self.input_wait_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.input_pending.store(false, Ordering::Release);
+        }
+        result
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
-        if self.tmux_domain.lock().is_some() {
+
+        // Signal that input is pending - this tells perform_actions to yield
+        self.input_pending.store(true, Ordering::Release);
+        self.input_wait_count.fetch_add(1, Ordering::AcqRel);
+
+        let result = if self.tmux_domain.lock().is_some() {
             log::trace!("key: {:?}", key);
             if key == KeyCode::Char('q') {
-                self.terminal.lock().send_paste("detach\n")?;
+                self.terminal.lock().send_paste("detach\n")
+            } else {
+                Ok(())
             }
-            return Ok(());
         } else {
             self.terminal.lock().key_down(key, mods)
+        };
+
+        // Clear pending flag if no more waiters
+        if self.input_wait_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.input_pending.store(false, Ordering::Release);
         }
+        result
     }
 
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
-        self.terminal.lock().key_up(key, mods)
+        // Signal that input is pending
+        self.input_pending.store(true, Ordering::Release);
+        self.input_wait_count.fetch_add(1, Ordering::AcqRel);
+
+        let result = self.terminal.lock().key_up(key, mods);
+
+        // Clear pending flag if no more waiters
+        if self.input_wait_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.input_pending.store(false, Ordering::Release);
+        }
+        result
     }
 
     fn resize(&self, size: TerminalSize) -> Result<(), Error> {
@@ -1019,6 +1095,8 @@ impl LocalPane {
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
+            input_pending: AtomicBool::new(false),
+            input_wait_count: AtomicUsize::new(0),
         }
     }
 

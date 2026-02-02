@@ -324,11 +324,12 @@ fn read_from_pane_pty(
     while !dead.load(Ordering::Relaxed) {
         match reader.read(&mut buf) {
             Ok(size) if size == 0 => {
-                log::trace!("read_pty EOF: pane_id {}", pane_id);
+                log::info!("read_pty EOF (shell exited normally): pane_id {}", pane_id);
                 break;
             }
             Err(err) => {
-                error!("read_pty failed: pane {} {:?}", pane_id, err);
+                // Log the error with more details for debugging
+                log::warn!("read_pty reader error for pane {}: {:?}", pane_id, err);
                 break;
             }
             Ok(size) => {
@@ -363,6 +364,15 @@ fn read_from_pane_pty(
                                             parse_buffered_data(pane_clone, &dead_clone, new_rx)
                                         });
                                         log::info!("read_pty recovered from socket error for pane {}", pane_id);
+                                        // Write the current buffer to the new socket
+                                        // This data was read successfully but failed to write
+                                        if let Err(e) = tx.write_all(&buf[..size]) {
+                                            error!(
+                                                "read_pty failed to write pending data after recovery for pane {}: {:?}",
+                                                pane_id, e
+                                            );
+                                            break;
+                                        }
                                         continue;
                                     }
                                     Err(e) => {

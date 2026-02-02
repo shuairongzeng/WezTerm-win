@@ -51,8 +51,16 @@ impl TerminalState {
         } else {
             log::trace!("{}: sending {:?}, {:?} {:?}", label, to_send, key, mods);
         }
-        self.writer.write_all(to_send.as_bytes())?;
-        self.writer.flush()?;
+
+        // Write to PTY with error logging
+        if let Err(e) = self.writer.write_all(to_send.as_bytes()) {
+            log::error!("{}: failed to write to PTY: {:?}", label, e);
+            return Err(e.into());
+        }
+        if let Err(e) = self.writer.flush() {
+            log::error!("{}: failed to flush PTY: {:?}", label, e);
+            return Err(e.into());
+        }
 
         Ok(())
     }
