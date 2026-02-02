@@ -97,7 +97,7 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     needs: build
-    if: github.repository == 'wezterm/wezterm'
+    if: github.repository == 'wezterm/wezterm' || github.repository == 'shuairongzeng/WezTerm-win'
     permissions:
       contents: write
       pages: write
@@ -113,8 +113,13 @@ jobs:
       - name: "Checksum"
         shell: bash
         run: "for f in WezTerm-*.zip WezTerm-*.exe ; do sha256sum $f > $f.sha256 ; done"
-      - name: "Upload to Nightly Release"
+      - name: "Create or Update Nightly Release"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
-        run: "bash ci/retry.sh gh release upload --clobber nightly WezTerm-*.zip WezTerm-*.exe *.sha256"
+        run: |
+          # Create nightly release if it doesn't exist
+          if ! gh release view nightly > /dev/null 2>&1; then
+            gh release create nightly --title "Nightly Build" --notes "Automated nightly build with Windows input priority fixes" --prerelease
+          fi
+          bash ci/retry.sh gh release upload --clobber nightly WezTerm-*.zip WezTerm-*.exe *.sha256
