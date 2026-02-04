@@ -1,26 +1,82 @@
 use anyhow::{anyhow, Context as _};
 use config::{create_user_owned_dirs, UnixDomain};
 use promise::spawn::spawn_into_main_thread;
+use std::time::{Duration, Instant};
 use wezterm_uds::UnixListener;
 
 pub struct LocalListener {
     listener: UnixListener,
+    unix_dom: UnixDomain,
 }
 
 impl LocalListener {
-    pub fn new(listener: UnixListener) -> Self {
-        Self { listener }
+    pub fn new(listener: UnixListener, unix_dom: UnixDomain) -> Self {
+        Self { listener, unix_dom }
     }
 
     pub fn with_domain(unix_dom: &UnixDomain) -> anyhow::Result<Self> {
         let listener = safely_create_sock_path(unix_dom)?;
-        Ok(Self::new(listener))
+        Ok(Self::new(listener, unix_dom.clone()))
+    }
+
+    /// Attempt to recover the socket listener after an error.
+    /// Returns true if recovery was successful, false otherwise.
+    #[cfg(windows)]
+    fn try_recover(&mut self) -> bool {
+        let sock_path = self.unix_dom.socket_path();
+        log::warn!(
+            "LocalListener: attempting to recover socket at {}",
+            sock_path.display()
+        );
+
+        // Try to recreate the socket
+        match safely_create_sock_path(&self.unix_dom) {
+            Ok(new_listener) => {
+                self.listener = new_listener;
+                log::info!(
+                    "LocalListener: successfully recovered socket at {}",
+                    sock_path.display()
+                );
+                true
+            }
+            Err(e) => {
+                log::error!(
+                    "LocalListener: failed to recover socket at {}: {:#}",
+                    sock_path.display(),
+                    e
+                );
+                false
+            }
+        }
     }
 
     pub fn run(&mut self) {
-        for stream in self.listener.incoming() {
-            match stream {
-                Ok(stream) => {
+        let sock_path = self.unix_dom.socket_path();
+        log::info!(
+            "LocalListener: starting listener on {}",
+            sock_path.display()
+        );
+
+        // Track consecutive errors for backoff
+        let mut consecutive_errors: u32 = 0;
+        let max_consecutive_errors: u32 = 10;
+        let mut last_error_time: Option<Instant> = None;
+
+        loop {
+            // Reset error count if we've had a successful period
+            if let Some(last_err) = last_error_time {
+                if last_err.elapsed() > Duration::from_secs(60) {
+                    consecutive_errors = 0;
+                    last_error_time = None;
+                }
+            }
+
+            match self.listener.accept() {
+                Ok((stream, _addr)) => {
+                    // Successful accept, reset error tracking
+                    consecutive_errors = 0;
+                    last_error_time = None;
+
                     spawn_into_main_thread(async move {
                         crate::dispatch::process(stream).await.map_err(|e| {
                             log::error!("{:#}", e);
@@ -30,8 +86,73 @@ impl LocalListener {
                     .detach();
                 }
                 Err(err) => {
-                    log::error!("accept failed: {}", err);
-                    return;
+                    consecutive_errors += 1;
+                    last_error_time = Some(Instant::now());
+
+                    log::error!(
+                        "LocalListener: accept failed (error {} of {}): {}",
+                        consecutive_errors,
+                        max_consecutive_errors,
+                        err
+                    );
+
+                    // On Windows, try to recover from socket errors
+                    #[cfg(windows)]
+                    {
+                        // Check for specific Windows socket errors that might be recoverable
+                        // 10053 = WSAECONNABORTED, 10054 = WSAECONNRESET
+                        // 10038 = WSAENOTSOCK, 10024 = WSAEMFILE
+                        // Also try recovery for unknown errors (no OS error code)
+                        let should_recover = match err.raw_os_error() {
+                            None => true, // Unknown error, try recovery
+                            Some(code) => matches!(code, 10053 | 10054 | 10038 | 10024 | 10022),
+                            // 10022 = WSAEINVAL (invalid argument, can happen if socket is in bad state)
+                        };
+
+                        if should_recover && consecutive_errors < max_consecutive_errors {
+                            // Exponential backoff before retry
+                            let backoff =
+                                Duration::from_millis(100 * (1u64 << consecutive_errors.min(6)));
+                            log::warn!(
+                                "LocalListener: waiting {:?} before recovery attempt",
+                                backoff
+                            );
+                            std::thread::sleep(backoff);
+
+                            if self.try_recover() {
+                                log::info!("LocalListener: recovery successful, continuing");
+                                // Reset error count after successful recovery
+                                consecutive_errors = 0;
+                                last_error_time = None;
+                                continue;
+                            }
+                        }
+                    }
+
+                    // On non-Windows or after max errors, check if we should exit
+                    #[cfg(not(windows))]
+                    {
+                        if consecutive_errors >= max_consecutive_errors {
+                            log::error!(
+                                "LocalListener: too many consecutive errors ({}), exiting",
+                                consecutive_errors
+                            );
+                            return;
+                        }
+                        // Brief pause before retrying on non-Windows
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+
+                    #[cfg(windows)]
+                    {
+                        if consecutive_errors >= max_consecutive_errors {
+                            log::error!(
+                                "LocalListener: too many consecutive errors ({}) and recovery failed, exiting",
+                                consecutive_errors
+                            );
+                            return;
+                        }
+                    }
                 }
             }
         }
