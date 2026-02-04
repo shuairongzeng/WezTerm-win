@@ -398,7 +398,7 @@ impl Pane for LocalPane {
         // This prevents input (key_down) from being blocked when there's heavy output.
         // We use input_pending flag to detect when input is waiting and yield immediately.
         const BATCH_SIZE: usize = 50;
-        const MAX_CONSECUTIVE_BATCHES: usize = 3;
+        const MAX_CONSECUTIVE_BATCHES: usize = 2; // Reduced from 3 for faster input response
 
         if actions.is_empty() {
             return;
@@ -407,8 +407,9 @@ impl Pane for LocalPane {
         if actions.len() <= BATCH_SIZE {
             // Small batch, process directly but still check for pending input
             if self.input_pending.load(Ordering::Acquire) {
-                // Input is waiting, yield first
+                // Input is waiting, yield first with a brief sleep
                 std::thread::yield_now();
+                std::thread::sleep(Duration::from_millis(1));
             }
             self.terminal.lock().perform_actions(actions);
         } else {
@@ -419,7 +420,7 @@ impl Pane for LocalPane {
                 if self.input_pending.load(Ordering::Acquire) {
                     // Input is waiting - yield aggressively to let it proceed
                     std::thread::yield_now();
-                    std::thread::sleep(Duration::from_micros(100));
+                    std::thread::sleep(Duration::from_millis(2)); // Increased from 100µs
                     consecutive_batches = 0;
                 }
 
@@ -429,6 +430,7 @@ impl Pane for LocalPane {
                 // After processing some batches, yield to prevent starvation
                 if consecutive_batches >= MAX_CONSECUTIVE_BATCHES {
                     std::thread::yield_now();
+                    std::thread::sleep(Duration::from_millis(1)); // Added sleep
                     consecutive_batches = 0;
                 }
             }
@@ -465,7 +467,17 @@ impl Pane for LocalPane {
                 Ok(())
             }
         } else {
-            self.terminal.lock().key_down(key, mods)
+            // Measure lock acquisition time for diagnostics
+            let lock_start = std::time::Instant::now();
+            let mut term = self.terminal.lock();
+            let lock_duration = lock_start.elapsed();
+            if lock_duration > Duration::from_millis(10) {
+                log::warn!(
+                    "key_down: slow terminal lock acquisition: {:?}",
+                    lock_duration
+                );
+            }
+            term.key_down(key, mods)
         };
 
         // Clear pending flag if no more waiters

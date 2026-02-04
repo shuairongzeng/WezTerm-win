@@ -54,7 +54,7 @@ use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, LinkedList, VecDeque};
 use std::ops::Add;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -190,6 +190,27 @@ pub struct OverlayState {
     pub key_table_state: KeyTableState,
 }
 
+/// Represents a pending input operation that needs to be retried.
+/// Used when WriterWrapper returns WouldBlock due to full buffer.
+#[derive(Clone, Debug)]
+pub enum InputOp {
+    /// Key down event with key code and modifiers
+    KeyDown(
+        ::wezterm_term::input::KeyCode,
+        ::wezterm_term::input::KeyModifiers,
+    ),
+    /// Key up event with key code and modifiers
+    KeyUp(
+        ::wezterm_term::input::KeyCode,
+        ::wezterm_term::input::KeyModifiers,
+    ),
+    /// Raw bytes to write directly
+    RawBytes(Vec<u8>),
+}
+
+/// Maximum number of pending input operations per pane
+const INPUT_QUEUE_CAPACITY: usize = 32;
+
 #[derive(Default)]
 pub struct PaneState {
     /// If is_some(), the top row of the visible screen.
@@ -201,6 +222,10 @@ pub struct PaneState {
     /// contents, we're overlaying a little internal application
     /// tab.  We'll also route input to it.
     pub overlay: Option<OverlayState>,
+
+    /// Queue of pending input operations that failed with WouldBlock.
+    /// These will be retried on the next frame or when PaneOutput arrives.
+    pub pending_input: VecDeque<InputOp>,
 
     bell_start: Option<Instant>,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
@@ -1433,10 +1458,93 @@ impl TermWindow {
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
+
+        // Try to flush any pending input for this pane
+        self.flush_pending_input(pane_id);
+
         if self.is_pane_visible(pane_id) {
             if let Some(ref win) = self.window {
                 win.invalidate();
             }
+        }
+    }
+
+    /// Attempt to send pending input operations for a pane.
+    /// Called when PaneOutput arrives or on timer retry.
+    pub fn flush_pending_input(&mut self, pane_id: PaneId) {
+        let mux = Mux::get();
+        let pane = match mux.get_pane(pane_id) {
+            Some(pane) => pane,
+            None => return,
+        };
+
+        // Get pending ops - we need to drain and potentially re-add failed ones
+        let mut pending: VecDeque<InputOp> = {
+            let mut state = self.pane_state(pane_id);
+            std::mem::take(&mut state.pending_input)
+        };
+
+        let mut failed: VecDeque<InputOp> = VecDeque::new();
+
+        while let Some(op) = pending.pop_front() {
+            let result = match &op {
+                InputOp::KeyDown(key, mods) => pane.key_down(key.clone(), mods.clone()),
+                InputOp::KeyUp(key, mods) => pane.key_up(key.clone(), mods.clone()),
+                InputOp::RawBytes(bytes) => pane.writer().write_all(bytes).map_err(|e| e.into()),
+            };
+
+            match result {
+                Ok(()) => {
+                    // Success, continue with next
+                }
+                Err(e) => {
+                    // Check if it's WouldBlock
+                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                        if io_err.kind() == std::io::ErrorKind::WouldBlock {
+                            // Still blocked, re-queue this and remaining ops
+                            failed.push_back(op);
+                            failed.extend(pending);
+                            break;
+                        }
+                    }
+                    // Other error, log and drop this op
+                    log::error!("Failed to send pending input: {:?}", e);
+                }
+            }
+        }
+
+        // Put failed ops back, respecting capacity
+        if !failed.is_empty() {
+            let mut state = self.pane_state(pane_id);
+            while state.pending_input.len() < INPUT_QUEUE_CAPACITY {
+                if let Some(op) = failed.pop_front() {
+                    state.pending_input.push_back(op);
+                } else {
+                    break;
+                }
+            }
+            // If we still have failed ops, the queue is full - ring bell
+            if !failed.is_empty() {
+                log::warn!(
+                    "Input queue full for pane {}, dropping {} operations",
+                    pane_id,
+                    failed.len()
+                );
+                // TODO: trigger bell notification
+            }
+        }
+    }
+
+    /// Queue an input operation for later retry.
+    /// Returns true if queued, false if queue is full (operation dropped).
+    pub fn queue_input_op(&mut self, pane_id: PaneId, op: InputOp) -> bool {
+        let mut state = self.pane_state(pane_id);
+        if state.pending_input.len() < INPUT_QUEUE_CAPACITY {
+            state.pending_input.push_back(op);
+            true
+        } else {
+            log::warn!("Input queue full for pane {}, dropping input", pane_id);
+            false
         }
     }
 

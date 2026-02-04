@@ -17,10 +17,12 @@ use config::{configuration, ExecDomain, SerialDomain, ValueOrFunc, WslDomain};
 use downcast_rs::{impl_downcast, Downcast};
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtySize, PtySystem};
+use smol::channel::{bounded, Sender, TrySendError};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use wezterm_term::TerminalSize;
 
@@ -493,25 +495,126 @@ impl LocalDomain {
 /// teach the Pane impl to reference the writer in the Termninal,
 /// but the Pane trait returns a RefMut and that makes it a bit
 /// awkward at the moment.
+///
+/// This version uses a bounded channel with a background thread to prevent
+/// blocking the GUI thread when the PTY buffer is full.
 #[derive(Clone)]
 pub(crate) struct WriterWrapper {
+    sender: Sender<Vec<u8>>,
+    /// Fallback for flush operations - we keep the writer reference
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Flag to indicate if the writer thread is still alive
+    writer_alive: Arc<AtomicBool>,
 }
 
 impl WriterWrapper {
     pub fn new(writer: Box<dyn Write + Send>) -> Self {
+        let writer_arc = Arc::new(Mutex::new(writer));
+        let writer_clone = Arc::clone(&writer_arc);
+        let writer_alive = Arc::new(AtomicBool::new(true));
+        let writer_alive_clone = Arc::clone(&writer_alive);
+
+        // Create a bounded channel with larger capacity to handle heavy bidirectional traffic
+        // 2048 allows more buffering during output bursts without blocking input
+        let (sender, receiver) = bounded::<Vec<u8>>(2048);
+
+        // Spawn a background thread to handle writes
+        std::thread::spawn(move || {
+            while let Ok(data) = receiver.recv_blocking() {
+                let mut w = writer_clone.lock();
+                if let Err(e) = w.write_all(&data) {
+                    log::error!(
+                        "WriterWrapper: write failed: {:?}, stopping writer thread",
+                        e
+                    );
+                    writer_alive_clone.store(false, Ordering::Release);
+                    break;
+                }
+                // Flush after each write to ensure data is sent immediately
+                // This is important for interactive input
+                if let Err(e) = w.flush() {
+                    log::error!(
+                        "WriterWrapper: flush failed: {:?}, stopping writer thread",
+                        e
+                    );
+                    writer_alive_clone.store(false, Ordering::Release);
+                    break;
+                }
+            }
+            writer_alive_clone.store(false, Ordering::Release);
+            log::info!("WriterWrapper: writer thread exiting");
+        });
+
         Self {
-            writer: Arc::new(Mutex::new(writer)),
+            sender,
+            writer: writer_arc,
+            writer_alive,
         }
     }
 }
 
 impl std::io::Write for WriterWrapper {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.writer.lock().write(buf)
+        // Check if writer thread is still alive
+        if !self.writer_alive.load(Ordering::Acquire) {
+            log::error!("WriterWrapper: writer thread is dead, cannot send data");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Writer thread is dead",
+            ));
+        }
+
+        // Try to send without blocking first
+        match self.sender.try_send(buf.to_vec()) {
+            Ok(()) => Ok(buf.len()),
+            Err(TrySendError::Full(_)) => {
+                // Channel is full - try spinning briefly then give up to avoid blocking GUI
+                log::warn!("WriterWrapper: channel full, spinning briefly");
+
+                // Spin for a short time with yields
+                for i in 0..100 {
+                    std::thread::yield_now();
+                    if i % 10 == 0 {
+                        // Brief sleep every 10 iterations
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
+                    match self.sender.try_send(buf.to_vec()) {
+                        Ok(()) => {
+                            log::info!("WriterWrapper: send succeeded after {} attempts", i + 1);
+                            return Ok(buf.len());
+                        }
+                        Err(TrySendError::Full(_)) => continue,
+                        Err(TrySendError::Closed(_)) => {
+                            log::error!("WriterWrapper: channel closed during retry");
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "Writer channel closed",
+                            ));
+                        }
+                    }
+                }
+
+                // After ~10ms of spinning, return WouldBlock to let caller handle retry
+                // This allows the GUI layer to queue the input and retry later
+                log::debug!("WriterWrapper: channel still full after 100 attempts (~10ms), returning WouldBlock for retry");
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "Input buffer full, please retry",
+                ))
+            }
+            Err(TrySendError::Closed(_)) => {
+                log::error!("WriterWrapper: channel closed");
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Writer channel closed",
+                ))
+            }
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        // Flush the underlying writer directly
+        // This is rarely called and can block briefly
         self.writer.lock().flush()
     }
 }

@@ -123,14 +123,23 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: V
     let start = Instant::now();
     match pane.upgrade() {
         Some(pane) => {
+            let action_count = actions.len();
             pane.perform_actions(actions);
-            histogram!("send_actions_to_mux.perform_actions.latency").record(start.elapsed());
+            let elapsed = start.elapsed();
+            histogram!("send_actions_to_mux.perform_actions.latency").record(elapsed);
+            if elapsed > Duration::from_millis(100) {
+                log::warn!(
+                    "send_actions_to_mux: perform_actions took {:?} for {} actions on pane {}",
+                    elapsed, action_count, pane.pane_id()
+                );
+            }
             Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id()));
         }
         None => {
             // Something else removed the pane from
             // the mux, so signal that we should stop
             // trying to process it in read_from_pane_pty.
+            log::warn!("send_actions_to_mux: pane.upgrade() failed, pane was removed from mux, setting dead=true");
             dead.store(true, Ordering::Relaxed);
         }
     }
@@ -138,6 +147,9 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: V
 }
 
 fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: FileDescriptor) {
+    let pane_id = pane.upgrade().map(|p| p.pane_id()).unwrap_or(0);
+    log::info!("parse_buffered_data: starting parser thread for pane {}", pane_id);
+
     let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![];
@@ -149,11 +161,17 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
     loop {
         match rx.read(&mut buf) {
             Ok(size) if size == 0 => {
-                dead.store(true, Ordering::Relaxed);
+                log::info!("parse_buffered_data: EOF on rx for pane {}", pane_id);
+                // Don't set dead = true here! Let the caller check parser_needs_recovery
+                // and decide whether to recover or exit. Setting dead here would cause
+                // the main loop to exit before it can check parser_needs_recovery.
                 break;
             }
-            Err(_) => {
-                dead.store(true, Ordering::Relaxed);
+            Err(err) => {
+                log::error!("parse_buffered_data: rx read error for pane {}: {:?}", pane_id, err);
+                // Don't set dead = true here! Let the caller check parser_needs_recovery
+                // and decide whether to recover or exit. Setting dead here would cause
+                // the main loop to exit before it can check parser_needs_recovery.
                 break;
             }
             Ok(size) => {
@@ -281,7 +299,7 @@ fn allocate_socketpair() -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
 fn read_from_pane_pty(
     pane: Weak<dyn Pane>,
     banner: Option<String>,
-    mut reader: Box<dyn std::io::Read>,
+    reader: Box<dyn std::io::Read + Send>,
 ) {
     let mut buf = vec![0; BUFSIZE];
 
@@ -290,6 +308,10 @@ fn read_from_pane_pty(
     // On Windows, this may be replaced with a new Arc when recovering from
     // socket errors, so it needs to be mutable.
     let mut dead = Arc::new(AtomicBool::new(false));
+
+    // Shared flag to signal that the parser has exited and needs recovery.
+    // This allows the reader loop to detect parser death even while blocked in read().
+    let parser_needs_recovery = Arc::new(AtomicBool::new(false));
 
     let (pane_id, exit_behavior) = match pane.upgrade() {
         Some(pane) => (pane.pane_id(), pane.exit_behavior()),
@@ -311,33 +333,170 @@ fn read_from_pane_pty(
         }
     };
 
+    // Use a channel to receive data from a dedicated reader thread.
+    // This allows us to do timed waits and check recovery flags without blocking forever.
+    let (data_tx, data_rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, std::io::ErrorKind>>(64);
+
+    // Spawn a dedicated PTY reader thread that sends data through the channel
+    let reader_dead = Arc::new(AtomicBool::new(false));
+    let reader_dead_clone = Arc::clone(&reader_dead);
+    let pane_id_for_reader = pane_id;  // Copy for the reader thread
+    std::thread::spawn(move || {
+        let mut reader = reader;  // Move reader into this thread
+        let mut local_buf = vec![0u8; BUFSIZE];
+        loop {
+            match reader.read(&mut local_buf) {
+                Ok(0) => {
+                    // EOF
+                    let _ = data_tx.send(Ok(Vec::new()));
+                    break;
+                }
+                Ok(size) => {
+                    if data_tx.send(Ok(local_buf[..size].to_vec())).is_err() {
+                        // Channel closed, exit
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = data_tx.send(Err(e.kind()));
+                    break;
+                }
+            }
+        }
+        reader_dead_clone.store(true, Ordering::Release);
+        log::info!("read_from_pane_pty: PTY reader thread exited for pane {}", pane_id_for_reader);
+    });
+
     std::thread::spawn({
         let dead = Arc::clone(&dead);
         let pane = pane.clone();
-        move || parse_buffered_data(pane, &dead, rx)
+        let parser_needs_recovery = Arc::clone(&parser_needs_recovery);
+        let pane_id_for_parser = pane_id;  // Copy for the parser thread
+        move || {
+            parse_buffered_data(pane, &dead, rx);
+            // Signal that parser has exited - the main loop may need to recover
+            parser_needs_recovery.store(true, Ordering::Release);
+            log::info!("parse_buffered_data: parser thread exited, recovery flag set for pane {}", pane_id_for_parser);
+        }
     });
 
     if let Some(banner) = banner {
         tx.write_all(banner.as_bytes()).ok();
     }
 
-    while !dead.load(Ordering::Relaxed) {
-        match reader.read(&mut buf) {
-            Ok(size) if size == 0 => {
+    // Recovery helper closure
+    #[cfg(windows)]
+    let mut do_recovery = |tx: &mut FileDescriptor,
+                           dead: &mut Arc<AtomicBool>,
+                           parser_needs_recovery: &Arc<AtomicBool>,
+                           pane: &Weak<dyn Pane>,
+                           pane_id: PaneId| -> bool {
+        log::warn!("read_from_pane_pty: parser died for pane {}, attempting recovery", pane_id);
+        match allocate_socketpair() {
+            Ok((new_tx, new_rx)) => {
+                *tx = new_tx;
+                let new_dead = Arc::new(AtomicBool::new(false));
+                *dead = new_dead;
+                parser_needs_recovery.store(false, Ordering::Release);
+                let pane_clone = pane.clone();
+                let dead_clone = Arc::clone(dead);
+                let recovery_clone = Arc::clone(parser_needs_recovery);
+                let pane_id_for_recovered = pane_id;  // Copy for the recovered parser thread
+                std::thread::spawn(move || {
+                    parse_buffered_data(pane_clone, &dead_clone, new_rx);
+                    recovery_clone.store(true, Ordering::Release);
+                    log::info!("parse_buffered_data: recovered parser thread exited, recovery flag set for pane {}", pane_id_for_recovered);
+                });
+                log::info!("read_from_pane_pty: recovered parser for pane {}", pane_id);
+                true
+            }
+            Err(e) => {
+                log::error!("read_from_pane_pty: failed to recover parser for pane {}: {:?}", pane_id, e);
+                false
+            }
+        }
+    };
+
+    loop {
+        // Check if parser died and needs recovery FIRST, before checking dead flag.
+        // This ensures recovery gets a chance even if dead was set by send_actions_to_mux
+        // (when pane.upgrade() fails).
+        if parser_needs_recovery.load(Ordering::Acquire) {
+            #[cfg(windows)]
+            {
+                if !do_recovery(&mut tx, &mut dead, &parser_needs_recovery, &pane, pane_id) {
+                    break;
+                }
+                continue;
+            }
+            #[cfg(not(windows))]
+            {
+                // On non-Windows, parser death is usually fatal
+                log::error!("read_from_pane_pty: parser died for pane {}, exiting", pane_id);
+                break;
+            }
+        }
+
+        // Use recv_timeout so we can periodically check recovery flags
+        // even when no PTY output arrives
+        let timeout = Duration::from_millis(500);
+        match data_rx.recv_timeout(timeout) {
+            Ok(Ok(data)) if data.is_empty() => {
+                // EOF from PTY
                 log::info!("read_pty EOF (shell exited normally): pane_id {}", pane_id);
                 break;
             }
-            Err(err) => {
-                // Log the error with more details for debugging
-                log::warn!("read_pty reader error for pane {}: {:?}", pane_id, err);
+            Ok(Err(err_kind)) => {
+                // Error from PTY reader
+                log::warn!("read_pty reader error for pane {}: {:?}", pane_id, err_kind);
                 break;
             }
-            Ok(size) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Timeout - check dead flag and loop back to check recovery flags
+                // We check dead here (after recovery check) so that recovery gets
+                // a chance to run even if dead was set by send_actions_to_mux
+                if dead.load(Ordering::Relaxed) {
+                    log::info!("read_from_pane_pty: dead flag set, exiting loop for pane {}", pane_id);
+                    break;
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Channel disconnected, reader thread exited
+                log::info!("read_from_pane_pty: data channel disconnected for pane {}", pane_id);
+                break;
+            }
+            Ok(Ok(data)) => {
+                let size = data.len();
                 histogram!("read_from_pane_pty.bytes.rate").record(size as f64);
                 log::trace!("read_pty pane {pane_id} read {size} bytes");
+
+                // Copy data to buf for write
+                buf[..size].copy_from_slice(&data);
+
+                // Check if parser died BEFORE attempting to write
+                if parser_needs_recovery.load(Ordering::Acquire) {
+                    #[cfg(windows)]
+                    {
+                        if !do_recovery(&mut tx, &mut dead, &parser_needs_recovery, &pane, pane_id) {
+                            break;
+                        }
+                        // Write the current buffer to the new socket
+                        if let Err(e) = tx.write_all(&buf[..size]) {
+                            error!("read_pty failed to write data after recovery for pane {}: {:?}", pane_id, e);
+                            break;
+                        }
+                        continue;
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        log::error!("read_from_pane_pty: parser died for pane {}, exiting", pane_id);
+                        break;
+                    }
+                }
+
                 if let Err(err) = tx.write_all(&buf[..size]) {
                     // On Windows, socket connections can be abruptly reset.
-                    // Check if this is a transient Windows socket error.
                     #[cfg(windows)]
                     {
                         if let Some(code) = err.raw_os_error() {
@@ -347,41 +506,18 @@ fn read_from_pane_pty(
                                     "read_pty transient socket error for pane {}: os error {}, attempting to recover",
                                     pane_id, code
                                 );
-                                // Try to reallocate the socketpair and parser thread
-                                match allocate_socketpair() {
-                                    Ok((new_tx, new_rx)) => {
-                                        tx = new_tx;
-                                        // Create a NEW dead flag for the new parser thread.
-                                        // The old parser thread will exit when its rx becomes invalid,
-                                        // and it will set the OLD dead flag. We don't want that to
-                                        // affect our new parser thread, so we create a fresh flag.
-                                        let new_dead = Arc::new(AtomicBool::new(false));
-                                        dead = new_dead;
-                                        // Spawn a new parser thread with the new rx and new dead flag
-                                        let pane_clone = pane.clone();
-                                        let dead_clone = Arc::clone(&dead);
-                                        std::thread::spawn(move || {
-                                            parse_buffered_data(pane_clone, &dead_clone, new_rx)
-                                        });
-                                        log::info!("read_pty recovered from socket error for pane {}", pane_id);
-                                        // Write the current buffer to the new socket
-                                        // This data was read successfully but failed to write
-                                        if let Err(e) = tx.write_all(&buf[..size]) {
-                                            error!(
-                                                "read_pty failed to write pending data after recovery for pane {}: {:?}",
-                                                pane_id, e
-                                            );
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                    Err(e) => {
+                                if do_recovery(&mut tx, &mut dead, &parser_needs_recovery, &pane, pane_id) {
+                                    // Write the current buffer to the new socket
+                                    if let Err(e) = tx.write_all(&buf[..size]) {
                                         error!(
-                                            "read_pty failed to recover socketpair for pane {}: {:?}",
+                                            "read_pty failed to write pending data after recovery for pane {}: {:?}",
                                             pane_id, e
                                         );
                                         break;
                                     }
+                                    continue;
+                                } else {
+                                    break;
                                 }
                             }
                         }

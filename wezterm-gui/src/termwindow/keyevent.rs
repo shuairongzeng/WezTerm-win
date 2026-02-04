@@ -1,4 +1,5 @@
 use crate::termwindow::InputMap;
+use crate::termwindow::InputOp;
 use ::window::{
     DeadKeyStatus, KeyCode, KeyEvent, KeyboardLedStatus, Modifiers, RawKeyEvent, WindowOps,
 };
@@ -366,19 +367,25 @@ impl super::TermWindow {
                             if self.config.debug_key_events {
                                 log::info!("win32: Encoded input as {:?}", encoded);
                             }
-                            pane.writer()
+                            if let Err(e) = pane
+                                .writer()
                                 .write_all(encoded.as_bytes())
                                 .context("sending win32-input-mode encoded data")
-                                .ok();
+                            {
+                                log::error!("win32-input-mode write failed: {:?}", e);
+                            }
                             did_encode = true;
                         } else if let Some(encoded) = self.encode_kitty_input(&pane, &key_event) {
                             if self.config.debug_key_events {
                                 log::info!("kitty: Encoded input as {:?}", encoded);
                             }
-                            pane.writer()
+                            if let Err(e) = pane
+                                .writer()
                                 .write_all(encoded.as_bytes())
                                 .context("sending kitty encoded data")
-                                .ok();
+                            {
+                                log::error!("kitty-input-mode write failed: {:?}", e);
+                            }
                             did_encode = true;
                         }
                     };
@@ -702,21 +709,50 @@ impl super::TermWindow {
                     }
                 };
 
-                if res.is_ok() {
-                    if window_key.key_is_down
-                        && !key.is_modifier()
-                        && self.pane_state(pane.pane_id()).overlay.is_none()
-                    {
-                        self.maybe_scroll_to_bottom_for_input(&pane);
+                match &res {
+                    Ok(()) => {
+                        if window_key.key_is_down
+                            && !key.is_modifier()
+                            && self.pane_state(pane.pane_id()).overlay.is_none()
+                        {
+                            self.maybe_scroll_to_bottom_for_input(&pane);
+                        }
+                        if window_key.key_is_down
+                            && self.config.hide_mouse_cursor_when_typing
+                            && !key.is_modifier()
+                        {
+                            context.set_cursor(None);
+                        }
+                        if !key.is_modifier() {
+                            context.invalidate();
+                        }
                     }
-                    if window_key.key_is_down
-                        && self.config.hide_mouse_cursor_when_typing
-                        && !key.is_modifier()
-                    {
-                        context.set_cursor(None);
-                    }
-                    if !key.is_modifier() {
-                        context.invalidate();
+                    Err(e) => {
+                        // Check if this is a WouldBlock error - queue for retry
+                        let is_would_block = e
+                            .downcast_ref::<std::io::Error>()
+                            .map(|io_err| io_err.kind() == std::io::ErrorKind::WouldBlock)
+                            .unwrap_or(false);
+
+                        if is_would_block {
+                            // Queue the input for later retry
+                            let op = if window_key.key_is_down {
+                                InputOp::KeyDown(key.clone(), modifiers)
+                            } else {
+                                InputOp::KeyUp(key.clone(), modifiers)
+                            };
+                            if self.queue_input_op(pane.pane_id(), op) {
+                                log::debug!(
+                                    "Input buffer full, queued key {:?} for pane {} retry",
+                                    key,
+                                    pane.pane_id()
+                                );
+                                // Schedule retry on next frame
+                                context.invalidate();
+                            }
+                        } else {
+                            log::error!("Failed to send key input to pane: {:?}", e);
+                        }
                     }
                 }
             }
@@ -735,9 +771,30 @@ impl super::TermWindow {
                 if self.config.debug_key_events {
                     log::info!("send to pane string={:?}", s);
                 }
-                pane.writer().write_all(s.as_bytes()).ok();
-                self.maybe_scroll_to_bottom_for_input(&pane);
-                context.invalidate();
+                // Handle WouldBlock for raw bytes
+                match pane.writer().write_all(s.as_bytes()) {
+                    Ok(()) => {
+                        self.maybe_scroll_to_bottom_for_input(&pane);
+                        context.invalidate();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Queue raw bytes for retry
+                        if self.queue_input_op(
+                            pane.pane_id(),
+                            InputOp::RawBytes(s.as_bytes().to_vec()),
+                        ) {
+                            log::debug!(
+                                "Input buffer full, queued {} bytes for pane {} retry",
+                                s.len(),
+                                pane.pane_id()
+                            );
+                            context.invalidate();
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to send composed input to pane: {:?}", e);
+                    }
+                }
             }
             Key::None => {}
         }
