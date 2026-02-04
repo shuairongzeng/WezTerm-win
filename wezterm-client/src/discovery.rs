@@ -227,10 +227,16 @@ mod windows {
                     .position(|&c| c == 0)
                     .ok_or_else(|| anyhow::anyhow!("shared memory is not NUL terminated!"))?;
 
-                let path = std::str::from_utf8(&source_slice[0..len])
+                let path_str = std::str::from_utf8(&source_slice[0..len])
                     .context("reading path from shared memory")?;
 
-                let path: PathBuf = path.into();
+                // The shared memory only stores the file name (e.g., "gui-sock-2204"),
+                // so we need to reconstruct the full path using RUNTIME_DIR
+                let path: PathBuf = if std::path::Path::new(path_str).is_absolute() {
+                    path_str.into()
+                } else {
+                    config::RUNTIME_DIR.join(path_str)
+                };
 
                 Ok(path)
             })
