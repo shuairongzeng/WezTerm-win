@@ -19,8 +19,8 @@ use winapi::um::winbase::{FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE};
 use winapi::um::winnt::HANDLE;
 use winapi::um::winsock2::{
     accept, bind, closesocket, connect, getsockname, getsockopt, htonl, ioctlsocket, listen, recv,
-    send, WSAGetLastError, WSAPoll, WSASocketW, WSAStartup, INVALID_SOCKET, SOCKET, SOCK_STREAM,
-    SOL_SOCKET, SO_ERROR, WSADATA, WSAENOTSOCK, WSA_FLAG_NO_HANDLE_INHERIT,
+    send, setsockopt, WSAGetLastError, WSAPoll, WSASocketW, WSAStartup, INVALID_SOCKET, SOCKET, SOCK_STREAM,
+    SOL_SOCKET, SO_ERROR, SO_KEEPALIVE, WSADATA, WSAENOTSOCK, WSA_FLAG_NO_HANDLE_INHERIT,
 };
 pub use winapi::um::winsock2::{POLLERR, POLLHUP, POLLIN, POLLOUT, WSAPOLLFD as pollfd};
 
@@ -547,6 +547,25 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
             handle_type: HandleType::Socket,
         },
     };
+
+    // Enable TCP Keep-Alive on both sockets to prevent Windows from
+    // closing idle loopback connections after ~5 minutes.
+    // This is a workaround for Windows TCP loopback idle timeout behavior.
+    let enable_keepalive = |socket: SOCKET| {
+        let optval: i32 = 1;
+        unsafe {
+            setsockopt(
+                socket,
+                SOL_SOCKET as i32,
+                SO_KEEPALIVE as i32,
+                &optval as *const i32 as *const i8,
+                std::mem::size_of::<i32>() as i32,
+            )
+        }
+    };
+    // Best effort: ignore errors from setsockopt as the sockets still work
+    let _ = enable_keepalive(server.as_raw_handle() as SOCKET);
+    let _ = enable_keepalive(client.as_raw_handle() as SOCKET);
 
     Ok((server, client))
 }
