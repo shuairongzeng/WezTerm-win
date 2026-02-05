@@ -19,8 +19,8 @@ use winapi::um::winbase::{FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE};
 use winapi::um::winnt::HANDLE;
 use winapi::um::winsock2::{
     accept, bind, closesocket, connect, getsockname, getsockopt, htonl, ioctlsocket, listen, recv,
-    send, setsockopt, WSAGetLastError, WSAPoll, WSASocketW, WSAStartup, INVALID_SOCKET, SOCKET, SOCK_STREAM,
-    SOL_SOCKET, SO_ERROR, SO_KEEPALIVE, WSADATA, WSAENOTSOCK, WSA_FLAG_NO_HANDLE_INHERIT,
+    send, WSAGetLastError, WSAPoll, WSASocketW, WSAStartup, INVALID_SOCKET, SOCKET, SOCK_STREAM,
+    SOL_SOCKET, SO_ERROR, WSADATA, WSAENOTSOCK, WSA_FLAG_NO_HANDLE_INHERIT,
 };
 pub use winapi::um::winsock2::{POLLERR, POLLHUP, POLLIN, POLLOUT, WSAPOLLFD as pollfd};
 
@@ -551,21 +551,45 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
     // Enable TCP Keep-Alive on both sockets to prevent Windows from
     // closing idle loopback connections after ~5 minutes.
     // This is a workaround for Windows TCP loopback idle timeout behavior.
-    let enable_keepalive = |socket: SOCKET| {
-        let optval: i32 = 1;
+    //
+    // Windows default keep-alive time is 2 hours, which is too long.
+    // We use SIO_KEEPALIVE_VALS to set shorter intervals:
+    // - keepalivetime: 60 seconds (time before first probe)
+    // - keepaliveinterval: 10 seconds (interval between probes)
+    #[repr(C)]
+    struct TcpKeepAlive {
+        onoff: u32,
+        keepalivetime: u32,
+        keepaliveinterval: u32,
+    }
+
+    const SIO_KEEPALIVE_VALS: u32 = 0x98000004; // _WSAIOW(IOC_VENDOR, 4)
+
+    let configure_keepalive = |socket: SOCKET| {
+        let keepalive = TcpKeepAlive {
+            onoff: 1,
+            keepalivetime: 60_000,    // 60 seconds in milliseconds
+            keepaliveinterval: 10_000, // 10 seconds in milliseconds
+        };
+        let mut bytes_returned: u32 = 0;
         unsafe {
-            setsockopt(
+            winapi::um::winsock2::WSAIoctl(
                 socket,
-                SOL_SOCKET as i32,
-                SO_KEEPALIVE as i32,
-                &optval as *const i32 as *const i8,
-                std::mem::size_of::<i32>() as i32,
+                SIO_KEEPALIVE_VALS,
+                &keepalive as *const TcpKeepAlive as *mut _,
+                std::mem::size_of::<TcpKeepAlive>() as u32,
+                ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                ptr::null_mut(),
+                None,
             )
         }
     };
-    // Best effort: ignore errors from setsockopt as the sockets still work
-    let _ = enable_keepalive(server.as_raw_handle() as SOCKET);
-    let _ = enable_keepalive(client.as_raw_handle() as SOCKET);
+    // Best effort: ignore errors from WSAIoctl as the sockets still work
+    // (just with default 2-hour keep-alive which may not prevent 5-min timeout)
+    let _ = configure_keepalive(server.as_raw_handle() as SOCKET);
+    let _ = configure_keepalive(client.as_raw_handle() as SOCKET);
 
     Ok((server, client))
 }

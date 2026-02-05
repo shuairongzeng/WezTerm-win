@@ -99,14 +99,20 @@ impl LocalListener {
                     // On Windows, try to recover from socket errors
                     #[cfg(windows)]
                     {
-                        // Check for specific Windows socket errors that might be recoverable
-                        // 10053 = WSAECONNABORTED, 10054 = WSAECONNRESET
-                        // 10038 = WSAENOTSOCK, 10024 = WSAEMFILE
-                        // Also try recovery for unknown errors (no OS error code)
+                        // Check for specific Windows socket errors that are recoverable:
+                        // 10053 = WSAECONNABORTED (connection aborted)
+                        // 10054 = WSAECONNRESET (connection reset by peer)
+                        // 10038 = WSAENOTSOCK (socket operation on non-socket)
+                        // 10024 = WSAEMFILE (too many open files)
+                        // 10022 = WSAEINVAL (invalid argument, socket in bad state)
+                        // 10093 = WSANOTINITIALISED (WSAStartup not called)
+                        // 10050 = WSAENETDOWN (network subsystem failed)
+                        //
+                        // We do NOT recover from errors without an OS code (None) as they
+                        // may indicate logic errors or unexpected conditions.
                         let should_recover = match err.raw_os_error() {
-                            None => true, // Unknown error, try recovery
-                            Some(code) => matches!(code, 10053 | 10054 | 10038 | 10024 | 10022),
-                            // 10022 = WSAEINVAL (invalid argument, can happen if socket is in bad state)
+                            None => false, // Unknown error, don't blindly recover - may mask real issues
+                            Some(code) => matches!(code, 10053 | 10054 | 10038 | 10024 | 10022 | 10093 | 10050),
                         };
 
                         if should_recover && consecutive_errors < max_consecutive_errors {
