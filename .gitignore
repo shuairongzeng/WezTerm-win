@@ -66,3 +66,10 @@ dhat-heap.json
 /__pycache__/
 /nix/result
 .beads/
+
+# Local packaging/session artifacts
+/.ccb_config/
+/dist/
+/dist-new/
+/nul
+/dist-new*&&*
