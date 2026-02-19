@@ -22,13 +22,41 @@ mod windows {
     use std::io::Error as IoError;
     use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
     use winapi::um::memoryapi::{
-        CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
+        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
     };
     use winapi::um::synchapi::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
-    use winapi::um::winbase::{INFINITE, WAIT_OBJECT_0};
+    use winapi::um::winbase::{INFINITE, WAIT_ABANDONED, WAIT_OBJECT_0};
     use winapi::um::winnt::{HANDLE, PAGE_READWRITE};
 
     const MAX_NAME: usize = 1024;
+
+    fn validate_shared_memory_path_len(path: &str) -> anyhow::Result<()> {
+        let len = path.len();
+        if len >= MAX_NAME {
+            anyhow::bail!(
+                "path '{}' is too long ({} bytes, max {})",
+                path,
+                len,
+                MAX_NAME - 1
+            );
+        }
+        Ok(())
+    }
+
+    fn resolve_shared_memory_socket_path(path_str: &str) -> anyhow::Result<PathBuf> {
+        if Path::new(path_str).is_absolute() {
+            return Ok(path_str.into());
+        }
+
+        if path_str.contains("..") {
+            anyhow::bail!(
+                "shared memory contains suspicious path with '..' components: {}",
+                path_str
+            );
+        }
+
+        Ok(config::RUNTIME_DIR.join(path_str))
+    }
 
     /// Keeps the published name alive for the duration of the process.
     pub struct NameHolder {
@@ -82,7 +110,7 @@ mod windows {
             let handle = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, wide_name.as_ptr()) };
             if handle.is_null() {
                 return Err(IoError::last_os_error())
-                    .with_context(|| format!("creating shared memory with name {}", name));
+                    .with_context(|| format!("opening shared memory with name {}", name));
             }
             Ok(Self {
                 name: name.to_string(),
@@ -139,7 +167,16 @@ mod windows {
             F: FnOnce() -> anyhow::Result<T>,
         {
             let res = unsafe { WaitForSingleObject(self.handle, INFINITE) };
-            if res != WAIT_OBJECT_0 {
+            // F07: Handle WAIT_ABANDONED - this means the previous owner (e.g.,
+            // wezterm-gui) crashed while holding the mutex. WAIT_ABANDONED still
+            // grants ownership, so we can proceed. The shared memory state may
+            // be inconsistent, but resolve() handles that gracefully.
+            if res == WAIT_ABANDONED {
+                log::warn!(
+                    "NamedMutex::with_lock: mutex was abandoned by previous owner \
+                     (process likely crashed). Proceeding with potentially stale data."
+                );
+            } else if res != WAIT_OBJECT_0 {
                 return Err(IoError::last_os_error()).context("acquire mutex");
             }
 
@@ -199,6 +236,7 @@ mod windows {
                 let mut view = mapping.map()?;
 
                 let target_slice = view.slice_mut();
+                validate_shared_memory_path_len(&path)?;
                 let len = path.len();
 
                 target_slice[0..len].copy_from_slice(path.as_bytes());
@@ -232,14 +270,43 @@ mod windows {
 
                 // The shared memory only stores the file name (e.g., "gui-sock-2204"),
                 // so we need to reconstruct the full path using RUNTIME_DIR
-                let path: PathBuf = if std::path::Path::new(path_str).is_absolute() {
-                    path_str.into()
-                } else {
-                    config::RUNTIME_DIR.join(path_str)
-                };
-
-                Ok(path)
+                resolve_shared_memory_socket_path(path_str)
             })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn shared_memory_path_len_allows_max_minus_one() {
+            let path = "a".repeat(MAX_NAME - 1);
+            assert!(validate_shared_memory_path_len(&path).is_ok());
+        }
+
+        #[test]
+        fn shared_memory_path_len_rejects_max_name() {
+            let path = "a".repeat(MAX_NAME);
+            assert!(validate_shared_memory_path_len(&path).is_err());
+        }
+
+        #[test]
+        fn resolve_shared_memory_path_joins_runtime_dir_for_relative_name() {
+            let resolved = resolve_shared_memory_socket_path("gui-sock-2204").unwrap();
+            assert_eq!(resolved, config::RUNTIME_DIR.join("gui-sock-2204"));
+        }
+
+        #[test]
+        fn resolve_shared_memory_path_rejects_parent_components() {
+            let err = resolve_shared_memory_socket_path("../evil-sock").unwrap_err();
+            assert!(err.to_string().contains("suspicious path"));
+        }
+
+        #[test]
+        fn resolve_shared_memory_path_preserves_absolute_path() {
+            let resolved = resolve_shared_memory_socket_path("C:\\temp\\gui-sock-2204").unwrap();
+            assert_eq!(resolved, PathBuf::from("C:\\temp\\gui-sock-2204"));
         }
     }
 

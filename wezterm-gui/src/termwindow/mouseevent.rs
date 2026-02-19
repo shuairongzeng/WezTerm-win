@@ -1,16 +1,16 @@
 use crate::tabbar::TabBarItem;
 use crate::termwindow::{
-    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
+    GuiWin, MouseCapture, PositionedSplit, ScrollHit, TMB, TermWindowNotif, UIItem, UIItemType,
 };
 use ::window::{
     MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
     WindowDecorations, WindowOps, WindowState,
 };
-use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
 use config::MouseEventAltScreen;
+use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
+use mux::Mux;
 use mux::pane::{Pane, WithPaneLines};
 use mux::tab::SplitDirection;
-use mux::Mux;
 use mux_lua::MuxPane;
 use std::convert::TryInto;
 use std::ops::Sub;
@@ -1032,7 +1032,23 @@ impl super::TermWindow {
         if allow_action
             && !(self.config.swallow_mouse_click_on_pane_focus && is_click_to_focus_pane)
         {
-            pane.mouse_event(mouse_event).ok();
+            // F04: Handle WouldBlock for mouse events instead of silently dropping
+            if let Err(e) = pane.mouse_event(mouse_event) {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    if io_err.kind() == std::io::ErrorKind::WouldBlock {
+                        let pane_id = pane.pane_id();
+                        self.queue_input_op(
+                            pane_id,
+                            crate::termwindow::InputOp::MouseEvent(mouse_event),
+                        );
+                        context.invalidate();
+                    } else {
+                        log::error!("mouse_event failed: {:?}", e);
+                    }
+                } else {
+                    log::error!("mouse_event failed: {:?}", e);
+                }
+            }
         }
 
         match event.kind {

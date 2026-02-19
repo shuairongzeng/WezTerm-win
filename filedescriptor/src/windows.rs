@@ -568,7 +568,7 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
     let configure_keepalive = |socket: SOCKET| {
         let keepalive = TcpKeepAlive {
             onoff: 1,
-            keepalivetime: 60_000,    // 60 seconds in milliseconds
+            keepalivetime: 60_000,     // 60 seconds in milliseconds
             keepaliveinterval: 10_000, // 10 seconds in milliseconds
         };
         let mut bytes_returned: u32 = 0;
@@ -586,10 +586,29 @@ pub fn socketpair_impl() -> Result<(FileDescriptor, FileDescriptor)> {
             )
         }
     };
-    // Best effort: ignore errors from WSAIoctl as the sockets still work
-    // (just with default 2-hour keep-alive which may not prevent 5-min timeout)
-    let _ = configure_keepalive(server.as_raw_handle() as SOCKET);
-    let _ = configure_keepalive(client.as_raw_handle() as SOCKET);
+    // F08: Log warnings on keep-alive failure instead of silently ignoring.
+    // If keep-alive fails, the original 5-minute idle timeout bug may recur.
+    // Note: filedescriptor crate doesn't depend on `log`, so we use eprintln.
+    let server_socket = server.as_raw_handle() as SOCKET;
+    let client_socket = client.as_raw_handle() as SOCKET;
+    let ret = configure_keepalive(server_socket);
+    if ret != 0 {
+        let wsa_err = unsafe { winapi::um::winsock2::WSAGetLastError() };
+        eprintln!(
+            "WARNING: Failed to configure TCP keep-alive on server socketpair: WSA error {}. \
+             Idle connections may timeout after ~5 minutes.",
+            wsa_err
+        );
+    }
+    let ret = configure_keepalive(client_socket);
+    if ret != 0 {
+        let wsa_err = unsafe { winapi::um::winsock2::WSAGetLastError() };
+        eprintln!(
+            "WARNING: Failed to configure TCP keep-alive on client socketpair: WSA error {}. \
+             Idle connections may timeout after ~5 minutes.",
+            wsa_err
+        );
+    }
 
     Ok((server, client))
 }

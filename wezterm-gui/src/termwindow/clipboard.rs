@@ -1,8 +1,8 @@
-use crate::termwindow::TermWindowNotif;
 use crate::TermWindow;
+use crate::termwindow::TermWindowNotif;
 use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource};
-use mux::pane::Pane;
 use mux::Mux;
+use mux::pane::Pane;
 use std::sync::Arc;
 use window::{Clipboard, WindowOps};
 
@@ -39,17 +39,40 @@ impl TermWindow {
         promise::spawn::spawn(async move {
             if let Ok(clip) = future.await {
                 window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
-                    if let Some(pane) = myself
-                        .pane_state(pane_id)
-                        .overlay
-                        .as_ref()
-                        .map(|overlay| overlay.pane.clone())
-                        .or_else(|| {
-                            let mux = Mux::get();
-                            mux.get_pane(pane_id)
-                        })
-                    {
-                        pane.send_paste(&clip).ok();
+                    // Get the pane, resolving overlay if present
+                    let pane = {
+                        let state = myself.pane_state(pane_id);
+                        state
+                            .overlay
+                            .as_ref()
+                            .map(|overlay| overlay.pane.clone())
+                    }
+                    .or_else(|| {
+                        let mux = Mux::get();
+                        mux.get_pane(pane_id)
+                    });
+
+                    if let Some(pane) = pane {
+                        // F03: Handle WouldBlock for paste operations instead of silently dropping
+                        if let Err(e) = pane.send_paste(&clip) {
+                            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                                if io_err.kind() == std::io::ErrorKind::WouldBlock {
+                                    myself.queue_input_op(
+                                        pane_id,
+                                        crate::termwindow::InputOp::Paste(clip.clone()),
+                                    );
+                                    log::warn!(
+                                        "Paste to pane {} got WouldBlock, queued for retry ({} bytes)",
+                                        pane_id,
+                                        clip.len()
+                                    );
+                                } else {
+                                    log::error!("Paste to pane {} failed: {:?}", pane_id, e);
+                                }
+                            } else {
+                                log::error!("Paste to pane {} failed: {:?}", pane_id, e);
+                            }
+                        }
                     }
                 })));
             }

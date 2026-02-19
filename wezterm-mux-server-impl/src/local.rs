@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Context as _};
-use config::{create_user_owned_dirs, UnixDomain};
+use anyhow::{Context as _, anyhow};
+use config::{UnixDomain, create_user_owned_dirs};
 use promise::spawn::spawn_into_main_thread;
 use std::time::{Duration, Instant};
 use wezterm_uds::UnixListener;
@@ -7,6 +7,18 @@ use wezterm_uds::UnixListener;
 pub struct LocalListener {
     listener: UnixListener,
     unix_dom: UnixDomain,
+}
+
+#[cfg(windows)]
+fn classify_windows_accept_error(code: Option<i32>) -> (bool, bool) {
+    match code {
+        None => (false, false),               // Unknown error, don't blindly recover
+        Some(10004 | 10035) => (true, false), // WSAEINTR, WSAEWOULDBLOCK: just retry
+        Some(10053 | 10054) => (true, false), // Connection-level: retry without rebuild
+        Some(10024) => (true, false),         // WSAEMFILE: wait for FDs, retry
+        Some(10038 | 10022 | 10050 | 10093) => (true, true), // Socket broken: rebuild
+        Some(_) => (false, false),            // Unknown code, don't recover
+    }
 }
 
 impl LocalListener {
@@ -62,6 +74,13 @@ impl LocalListener {
         let max_consecutive_errors: u32 = 10;
         let mut last_error_time: Option<Instant> = None;
 
+        // F06: Track total recovery attempts to prevent infinite recovery loops
+        // when the underlying problem is persistent.
+        #[cfg(windows)]
+        let mut total_recoveries: u32 = 0;
+        #[cfg(windows)]
+        let max_total_recoveries: u32 = 20;
+
         loop {
             // Reset error count if we've had a successful period
             if let Some(last_err) = last_error_time {
@@ -90,32 +109,24 @@ impl LocalListener {
                     last_error_time = Some(Instant::now());
 
                     log::error!(
-                        "LocalListener: accept failed (error {} of {}): {}",
+                        "LocalListener: accept failed (error {} of {}): {} (os_error={:?})",
                         consecutive_errors,
                         max_consecutive_errors,
-                        err
+                        err,
+                        err.raw_os_error()
                     );
 
                     // On Windows, try to recover from socket errors
                     #[cfg(windows)]
                     {
-                        // Check for specific Windows socket errors that are recoverable:
-                        // 10053 = WSAECONNABORTED (connection aborted)
-                        // 10054 = WSAECONNRESET (connection reset by peer)
-                        // 10038 = WSAENOTSOCK (socket operation on non-socket)
-                        // 10024 = WSAEMFILE (too many open files)
-                        // 10022 = WSAEINVAL (invalid argument, socket in bad state)
-                        // 10093 = WSANOTINITIALISED (WSAStartup not called)
-                        // 10050 = WSAENETDOWN (network subsystem failed)
-                        //
-                        // We do NOT recover from errors without an OS code (None) as they
-                        // may indicate logic errors or unexpected conditions.
-                        let should_recover = match err.raw_os_error() {
-                            None => false, // Unknown error, don't blindly recover - may mask real issues
-                            Some(code) => matches!(code, 10053 | 10054 | 10038 | 10024 | 10022 | 10093 | 10050),
-                        };
+                        // F10: Classify errors into retry-only vs needs-rebuild.
+                        // Connection-level errors (10053, 10054) don't need socket rebuild.
+                        // Transient errors (10004 WSAEINTR, 10035 WSAEWOULDBLOCK) just need retry.
+                        // Socket-level errors (10038, 10022, 10050, 10093) need full rebuild.
+                        let (should_retry, should_rebuild) =
+                            classify_windows_accept_error(err.raw_os_error());
 
-                        if should_recover && consecutive_errors < max_consecutive_errors {
+                        if should_retry && consecutive_errors < max_consecutive_errors {
                             // Exponential backoff before retry
                             let backoff =
                                 Duration::from_millis(100 * (1u64 << consecutive_errors.min(6)));
@@ -125,13 +136,43 @@ impl LocalListener {
                             );
                             std::thread::sleep(backoff);
 
-                            if self.try_recover() {
-                                log::info!("LocalListener: recovery successful, continuing");
-                                // Reset error count after successful recovery
-                                consecutive_errors = 0;
-                                last_error_time = None;
+                            if should_rebuild {
+                                // F06: Check total recovery limit
+                                if total_recoveries >= max_total_recoveries {
+                                    log::error!(
+                                        "LocalListener: reached total recovery limit ({}/{}), giving up",
+                                        total_recoveries,
+                                        max_total_recoveries
+                                    );
+                                    return;
+                                }
+
+                                if self.try_recover() {
+                                    total_recoveries += 1;
+                                    log::info!(
+                                        "LocalListener: recovery successful ({}/{}), continuing",
+                                        total_recoveries,
+                                        max_total_recoveries
+                                    );
+                                    // Reset consecutive error count (but NOT total_recoveries)
+                                    consecutive_errors = 0;
+                                    last_error_time = None;
+                                    continue;
+                                }
+                                // Recovery failed, fall through to exit check
+                            } else {
+                                // Retry-only: no rebuild needed, just loop back
                                 continue;
                             }
+                        }
+
+                        // F05: Non-retryable errors should also sleep to prevent CPU spin
+                        if !should_retry {
+                            log::warn!(
+                                "LocalListener: non-recoverable error code {:?}, waiting 500ms",
+                                err.raw_os_error()
+                            );
+                            std::thread::sleep(Duration::from_millis(500));
                         }
                     }
 
@@ -218,4 +259,24 @@ fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<UnixListener
     config::set_sticky_bit(&sock_path);
 
     Ok(listener)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::classify_windows_accept_error;
+
+    #[test]
+    fn windows_accept_error_classification_matrix() {
+        assert_eq!(classify_windows_accept_error(None), (false, false));
+        assert_eq!(classify_windows_accept_error(Some(10004)), (true, false));
+        assert_eq!(classify_windows_accept_error(Some(10035)), (true, false));
+        assert_eq!(classify_windows_accept_error(Some(10053)), (true, false));
+        assert_eq!(classify_windows_accept_error(Some(10054)), (true, false));
+        assert_eq!(classify_windows_accept_error(Some(10024)), (true, false));
+        assert_eq!(classify_windows_accept_error(Some(10038)), (true, true));
+        assert_eq!(classify_windows_accept_error(Some(10022)), (true, true));
+        assert_eq!(classify_windows_accept_error(Some(10050)), (true, true));
+        assert_eq!(classify_windows_accept_error(Some(10093)), (true, true));
+        assert_eq!(classify_windows_accept_error(Some(12345)), (false, false));
+    }
 }

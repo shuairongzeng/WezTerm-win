@@ -5,9 +5,9 @@ use crate::colorease::ColorEase;
 use crate::frontend::{front_end, try_front_end};
 use crate::inputmap::InputMap;
 use crate::overlay::{
+    CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags, QuickSelectOverlay,
     confirm_close_pane, confirm_close_tab, confirm_close_window, confirm_quit_program, launcher,
-    start_overlay, start_overlay_pane, CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags,
-    QuickSelectOverlay,
+    start_overlay, start_overlay_pane,
 };
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::scripting::guiwin::GuiWin;
@@ -16,7 +16,7 @@ use crate::selection::Selection;
 use crate::shapecache::*;
 use crate::tabbar::{TabBarItem, TabBarState};
 use crate::termwindow::background::{
-    load_background_image, reload_background_image, LoadedBackgroundLayer,
+    LoadedBackgroundLayer, load_background_image, reload_background_image,
 };
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
@@ -28,15 +28,15 @@ use crate::termwindow::render::{
 use crate::termwindow::webgpu::WebGpuState;
 use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{Context, anyhow, ensure};
 use config::keyassignment::{
     Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, Pattern, PromptInputLine,
     QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
 };
 use config::window::WindowLevel;
 use config::{
-    configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection,
-    GeometryOrigin, GuiPosition, TermConfig, WindowCloseConfirmation,
+    AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection, GeometryOrigin,
+    GuiPosition, TermConfig, WindowCloseConfirmation, configuration,
 };
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -51,8 +51,8 @@ use mux::tab::{
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
-use smol::channel::Sender;
 use smol::Timer;
+use smol::channel::Sender;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList, VecDeque};
 use std::ops::Add;
@@ -206,10 +206,15 @@ pub enum InputOp {
     ),
     /// Raw bytes to write directly
     RawBytes(Vec<u8>),
+    /// F04: Mouse event that needs retry
+    MouseEvent(::wezterm_term::MouseEvent),
+    /// F03: Paste content that needs retry
+    Paste(String),
 }
 
 /// Maximum number of pending input operations per pane
-const INPUT_QUEUE_CAPACITY: usize = 32;
+/// F11: Increased from 32 to 128 to handle rapid typing during output bursts
+const INPUT_QUEUE_CAPACITY: usize = 128;
 
 #[derive(Default)]
 pub struct PaneState {
@@ -229,6 +234,110 @@ pub struct PaneState {
 
     bell_start: Option<Instant>,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
+}
+
+fn clear_pending_input_for_absent_pane(
+    pane_states: &mut HashMap<PaneId, PaneState>,
+    pane_id: PaneId,
+) -> usize {
+    match pane_states.get_mut(&pane_id) {
+        Some(state) => {
+            let dropped = state.pending_input.len();
+            state.pending_input.clear();
+            dropped
+        }
+        None => 0,
+    }
+}
+
+fn remove_runtime_state_for_pane(
+    pane_states: &mut HashMap<PaneId, PaneState>,
+    semantic_zones: &mut HashMap<PaneId, SemanticZoneCache>,
+    pane_id: PaneId,
+) -> usize {
+    let dropped = pane_states
+        .remove(&pane_id)
+        .map(|state| state.pending_input.len())
+        .unwrap_or(0);
+    semantic_zones.remove(&pane_id);
+    dropped
+}
+
+#[cfg(test)]
+mod pending_input_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn pending_input_cleanup_clears_existing_queue() {
+        let pane_id: PaneId = 42;
+        let mut pane_states = HashMap::<PaneId, PaneState>::new();
+        let mut pane_state = PaneState::default();
+        pane_state
+            .pending_input
+            .push_back(InputOp::RawBytes(vec![1, 2, 3]));
+        pane_states.insert(pane_id, pane_state);
+
+        let dropped = clear_pending_input_for_absent_pane(&mut pane_states, pane_id);
+
+        assert_eq!(dropped, 1);
+        assert!(
+            pane_states
+                .get(&pane_id)
+                .expect("pane state should exist")
+                .pending_input
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pending_input_cleanup_is_noop_when_state_missing() {
+        let pane_id: PaneId = 100;
+        let mut pane_states = HashMap::<PaneId, PaneState>::new();
+
+        let dropped = clear_pending_input_for_absent_pane(&mut pane_states, pane_id);
+
+        assert_eq!(dropped, 0);
+        assert!(!pane_states.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn pane_removed_cleanup_removes_runtime_state_entries() {
+        let pane_id: PaneId = 77;
+        let mut pane_states = HashMap::<PaneId, PaneState>::new();
+        let mut pane_state = PaneState::default();
+        pane_state
+            .pending_input
+            .push_back(InputOp::RawBytes(vec![9]));
+        pane_states.insert(pane_id, pane_state);
+
+        let mut semantic_zones = HashMap::<PaneId, SemanticZoneCache>::new();
+        semantic_zones.insert(
+            pane_id,
+            SemanticZoneCache {
+                seqno: 1,
+                zones: vec![10],
+            },
+        );
+
+        let dropped = remove_runtime_state_for_pane(&mut pane_states, &mut semantic_zones, pane_id);
+
+        assert_eq!(dropped, 1);
+        assert!(!pane_states.contains_key(&pane_id));
+        assert!(!semantic_zones.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn pane_removed_cleanup_is_noop_when_pane_unknown() {
+        let pane_id: PaneId = 78;
+        let mut pane_states = HashMap::<PaneId, PaneState>::new();
+        let mut semantic_zones = HashMap::<PaneId, SemanticZoneCache>::new();
+
+        let dropped = remove_runtime_state_for_pane(&mut pane_states, &mut semantic_zones, pane_id);
+
+        assert_eq!(dropped, 0);
+        assert!(pane_states.is_empty());
+        assert!(semantic_zones.is_empty());
+    }
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -1333,9 +1442,25 @@ impl TermWindow {
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();
                 }
+                MuxNotification::PaneRemoved(pane_id) => {
+                    let dropped = {
+                        let mut pane_states = self.pane_state.borrow_mut();
+                        remove_runtime_state_for_pane(
+                            &mut pane_states,
+                            &mut self.semantic_zones,
+                            pane_id,
+                        )
+                    };
+                    if dropped > 0 {
+                        log::debug!(
+                            "PaneRemoved: cleaned pane {} runtime state, dropped {} queued input ops",
+                            pane_id,
+                            dropped
+                        );
+                    }
+                }
                 MuxNotification::PaneAdded(_)
                 | MuxNotification::WorkspaceRenamed { .. }
-                | MuxNotification::PaneRemoved(_)
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::Empty
@@ -1416,6 +1541,7 @@ impl TermWindow {
 
         self.pane_state.borrow_mut().clear();
         self.tab_state.borrow_mut().clear();
+        self.semantic_zones.clear();
     }
 
     fn apply_icon(window: &Window) -> anyhow::Result<()> {
@@ -1475,7 +1601,20 @@ impl TermWindow {
         let mux = Mux::get();
         let pane = match mux.get_pane(pane_id) {
             Some(pane) => pane,
-            None => return,
+            None => {
+                let dropped = {
+                    let mut pane_states = self.pane_state.borrow_mut();
+                    clear_pending_input_for_absent_pane(&mut pane_states, pane_id)
+                };
+                if dropped > 0 {
+                    log::debug!(
+                        "flush_pending_input: pane {} absent, dropped {} queued input operations",
+                        pane_id,
+                        dropped
+                    );
+                }
+                return;
+            }
         };
 
         // Get pending ops - we need to drain and potentially re-add failed ones
@@ -1491,6 +1630,8 @@ impl TermWindow {
                 InputOp::KeyDown(key, mods) => pane.key_down(key.clone(), mods.clone()),
                 InputOp::KeyUp(key, mods) => pane.key_up(key.clone(), mods.clone()),
                 InputOp::RawBytes(bytes) => pane.writer().write_all(bytes).map_err(|e| e.into()),
+                InputOp::MouseEvent(event) => pane.mouse_event(*event),
+                InputOp::Paste(text) => pane.send_paste(text).map_err(|e| e.into()),
             };
 
             match result {
@@ -1540,12 +1681,61 @@ impl TermWindow {
     pub fn queue_input_op(&mut self, pane_id: PaneId, op: InputOp) -> bool {
         let mut state = self.pane_state(pane_id);
         if state.pending_input.len() < INPUT_QUEUE_CAPACITY {
+            let was_empty = state.pending_input.is_empty();
             state.pending_input.push_back(op);
+            drop(state); // Release borrow before scheduling timer
+
+            // F01: When the queue transitions from empty to non-empty,
+            // schedule a timer-based retry. This prevents deadlock when
+            // the process is waiting for input before producing output
+            // (PaneOutput would never arrive to trigger flush_pending_input).
+            if was_empty {
+                if let Some(ref win) = self.window {
+                    let window = win.clone();
+                    promise::spawn::spawn(async move {
+                        smol::Timer::after(Duration::from_millis(50)).await;
+                        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                            term_window.flush_pending_input(pane_id);
+                            if term_window.has_pending_input(pane_id) {
+                                term_window.schedule_input_flush_timer(pane_id);
+                            }
+                        })));
+                    })
+                    .detach();
+                }
+            }
+
             true
         } else {
             log::warn!("Input queue full for pane {}, dropping input", pane_id);
             false
         }
+    }
+
+    /// F01: Schedule a delayed timer to retry flushing pending input.
+    /// Called when flush_pending_input completes but the queue is still non-empty.
+    fn schedule_input_flush_timer(&self, pane_id: PaneId) {
+        if let Some(ref win) = self.window {
+            let window = win.clone();
+            promise::spawn::spawn(async move {
+                smol::Timer::after(Duration::from_millis(50)).await;
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.flush_pending_input(pane_id);
+                    if term_window.has_pending_input(pane_id) {
+                        term_window.schedule_input_flush_timer(pane_id);
+                    }
+                })));
+            })
+            .detach();
+        }
+    }
+
+    fn has_pending_input(&self, pane_id: PaneId) -> bool {
+        self.pane_state
+            .borrow()
+            .get(&pane_id)
+            .map(|state| !state.pending_input.is_empty())
+            .unwrap_or(false)
     }
 
     fn mux_pane_output_event_callback(

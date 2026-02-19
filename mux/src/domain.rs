@@ -613,9 +613,12 @@ impl std::io::Write for WriterWrapper {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        // Flush the underlying writer directly
-        // This is rarely called and can block briefly
-        self.writer.lock().flush()
+        // F13: The background writer thread already flushes after every write_all
+        // (line 535). Calling flush() directly on the writer races with the
+        // background thread and doesn't guarantee channel data has been flushed.
+        // Making this a no-op is correct: the semantic guarantee of flush is
+        // already provided by the background thread's write+flush cycle.
+        Ok(())
     }
 }
 

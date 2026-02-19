@@ -398,7 +398,7 @@ impl Pane for LocalPane {
         // This prevents input (key_down) from being blocked when there's heavy output.
         // We use input_pending flag to detect when input is waiting and yield immediately.
         const BATCH_SIZE: usize = 50;
-        const MAX_CONSECUTIVE_BATCHES: usize = 2; // Reduced from 3 for faster input response
+        const MAX_CONSECUTIVE_BATCHES: usize = 2;
 
         if actions.is_empty() {
             return;
@@ -407,9 +407,9 @@ impl Pane for LocalPane {
         if actions.len() <= BATCH_SIZE {
             // Small batch, process directly but still check for pending input
             if self.input_pending.load(Ordering::Acquire) {
-                // Input is waiting, yield first with a brief sleep
+                // F09: Reduced from 1ms to 100us to minimize output latency
                 std::thread::yield_now();
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_micros(100));
             }
             self.terminal.lock().perform_actions(actions);
         } else {
@@ -418,9 +418,11 @@ impl Pane for LocalPane {
             for chunk in actions.chunks(BATCH_SIZE) {
                 // Check if input is pending before acquiring lock
                 if self.input_pending.load(Ordering::Acquire) {
-                    // Input is waiting - yield aggressively to let it proceed
+                    // F09: Reduced from 2ms to 200us -- still enough for the GUI
+                    // thread to acquire the terminal lock, but avoids ~40ms cumulative
+                    // delay when processing 1000+ actions with input pending.
                     std::thread::yield_now();
-                    std::thread::sleep(Duration::from_millis(2)); // Increased from 100µs
+                    std::thread::sleep(Duration::from_micros(200));
                     consecutive_batches = 0;
                 }
 
@@ -429,8 +431,9 @@ impl Pane for LocalPane {
 
                 // After processing some batches, yield to prevent starvation
                 if consecutive_batches >= MAX_CONSECUTIVE_BATCHES {
+                    // F09: Reduced from 1ms to 100us
                     std::thread::yield_now();
-                    std::thread::sleep(Duration::from_millis(1)); // Added sleep
+                    std::thread::sleep(Duration::from_micros(100));
                     consecutive_batches = 0;
                 }
             }

@@ -1,5 +1,5 @@
-# WezTerm Windows 编译脚本
-# 用法: .\build-wezterm.ps1 [-Release] [-Debug] [-Clean] [-Install]
+# WezTerm Windows build script
+# Usage: .\build-wezterm.ps1 [-Release] [-Debug] [-Clean] [-Install]
 
 param(
     [switch]$Release = $true,
@@ -12,104 +12,88 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = $PSScriptRoot
 
-# 颜色输出
-function Write-Step { param($msg) Write-Host "▶ $msg" -ForegroundColor Cyan }
-function Write-Success { param($msg) Write-Host "✓ $msg" -ForegroundColor Green }
-function Write-Warning { param($msg) Write-Host "⚠ $msg" -ForegroundColor Yellow }
-function Write-Error { param($msg) Write-Host "✗ $msg" -ForegroundColor Red }
+function Write-Step { param($msg) Write-Host "[STEP] $msg" -ForegroundColor Cyan }
+function Write-Success { param($msg) Write-Host "[OK]   $msg" -ForegroundColor Green }
+function Write-WarningMsg { param($msg) Write-Host "[WARN] $msg" -ForegroundColor Yellow }
+function Write-ErrorMsg { param($msg) Write-Host "[ERR]  $msg" -ForegroundColor Red }
 
 if ($Help) {
     Write-Host @"
-WezTerm Windows 编译脚本
+WezTerm Windows build script
 
-用法:
-    .\build-wezterm.ps1              # 编译 Release 版本
-    .\build-wezterm.ps1 -Debug       # 编译 Debug 版本
-    .\build-wezterm.ps1 -Clean       # 清理后重新编译
-    .\build-wezterm.ps1 -Install     # 编译并安装到 dist 目录
+Usage:
+    .\build-wezterm.ps1                Build Release (default)
+    .\build-wezterm.ps1 -Debug         Build Debug
+    .\build-wezterm.ps1 -Clean         Clean target first
+    .\build-wezterm.ps1 -Install       Copy built binaries to dist-new
 
-选项:
-    -Release    编译优化版本 (默认)
-    -Debug      编译调试版本
-    -Clean      清理 target 目录后编译
-    -Install    编译后复制到 dist-new 目录
-    -Help       显示此帮助信息
-
-注意:
-    - 需要 Rust 工具链 (cargo)
-    - 需要 Strawberry Perl (用于 OpenSSL 编译)
-    - 编译大约需要 1-2 分钟
+Options:
+    -Release    Build optimized binaries (default)
+    -Debug      Build debug binaries
+    -Clean      Run cargo clean before build
+    -Install    Copy binaries to dist-new after build
+    -Help       Show this help
 "@
     exit 0
 }
 
-# 检查依赖
-Write-Step "检查编译环境..."
+Write-Step "Checking build environment..."
 
-# 检查 cargo
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    Write-Error "未找到 cargo，请安装 Rust 工具链"
+    Write-ErrorMsg "cargo not found. Please install Rust toolchain."
     exit 1
 }
 Write-Success "cargo: $(cargo --version)"
 
-# 检查 Strawberry Perl
 $StrawberryPerl = "C:\Strawberry\perl\bin\perl.exe"
 if (-not (Test-Path $StrawberryPerl)) {
-    Write-Warning "未找到 Strawberry Perl ($StrawberryPerl)"
-    Write-Warning "OpenSSL 编译可能会失败"
+    Write-WarningMsg "Strawberry Perl not found at $StrawberryPerl"
+    Write-WarningMsg "OpenSSL builds may fail depending on local setup."
 } else {
     Write-Success "Strawberry Perl: $StrawberryPerl"
 }
 
-# 切换到项目目录
 Set-Location $ProjectRoot
 
-# 清理
 if ($Clean) {
-    Write-Step "清理 target 目录..."
+    Write-Step "Cleaning target directory..."
     cargo clean
-    Write-Success "清理完成"
+    Write-Success "Clean completed."
 }
 
-# 确定编译配置
 $BuildType = if ($Debug) { "" } else { "--release" }
 $BuildTypeName = if ($Debug) { "Debug" } else { "Release" }
 $TargetDir = if ($Debug) { "target\debug" } else { "target\release" }
 
-Write-Step "开始编译 $BuildTypeName 版本..."
-
-# 编译 wezterm (CLI)
-Write-Step "编译 wezterm..."
+Write-Step "Starting $BuildTypeName build..."
 $env:PATH = "C:\Strawberry\perl\bin;$env:PATH"
+
+Write-Step "Building wezterm..."
 cargo build $BuildType -p wezterm
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "wezterm 编译失败"
+    Write-ErrorMsg "wezterm build failed."
     exit 1
 }
-Write-Success "wezterm 编译完成"
+Write-Success "wezterm build completed."
 
-# 编译 wezterm-gui
-Write-Step "编译 wezterm-gui..."
+Write-Step "Building wezterm-gui..."
 cargo build $BuildType -p wezterm-gui
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "wezterm-gui 编译失败"
+    Write-ErrorMsg "wezterm-gui build failed."
     exit 1
 }
-Write-Success "wezterm-gui 编译完成"
+Write-Success "wezterm-gui build completed."
 
-# 编译 wezterm-mux-server (可选)
-Write-Step "编译 wezterm-mux-server..."
+Write-Step "Building wezterm-mux-server..."
 cargo build $BuildType -p wezterm-mux-server
 if ($LASTEXITCODE -ne 0) {
-    Write-Warning "wezterm-mux-server 编译失败 (非关键)"
+    Write-WarningMsg "wezterm-mux-server build failed (non-fatal)."
 } else {
-    Write-Success "wezterm-mux-server 编译完成"
+    Write-Success "wezterm-mux-server build completed."
 }
 
-# 显示编译结果
 Write-Host ""
-Write-Step "编译产物:"
+Write-Step "Build artifacts:"
 $Executables = @(
     "wezterm.exe",
     "wezterm-gui.exe",
@@ -123,11 +107,9 @@ foreach ($exe in $Executables) {
     }
 }
 
-# 安装到 dist-new
 if ($Install) {
     Write-Host ""
-    Write-Step "复制到 dist-new 目录..."
-
+    Write-Step "Copying binaries to dist-new..."
     $DistNew = Join-Path $ProjectRoot "dist-new"
     if (-not (Test-Path $DistNew)) {
         New-Item -ItemType Directory -Path $DistNew | Out-Null
@@ -137,18 +119,13 @@ if ($Install) {
         $src = Join-Path $TargetDir $exe
         if (Test-Path $src) {
             Copy-Item $src $DistNew -Force
-            Write-Success "已复制 $exe"
+            Write-Success "Copied $exe"
         }
     }
 
     Write-Host ""
-    Write-Success "文件已复制到: $DistNew"
-    Write-Host ""
-    Write-Host "替换步骤:" -ForegroundColor Yellow
-    Write-Host "  1. 关闭当前 WezTerm"
-    Write-Host "  2. 执行: copy $DistNew\*.exe $ProjectRoot\dist\"
-    Write-Host "  3. 启动新版 WezTerm"
+    Write-Success "Copied binaries to: $DistNew"
 }
 
 Write-Host ""
-Write-Success "编译完成！"
+Write-Success "Build completed."
