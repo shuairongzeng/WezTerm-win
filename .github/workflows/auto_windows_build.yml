@@ -72,3 +72,40 @@ jobs:
             dist/*.exe
             wezterm-windows-binaries.zip
           retention-days: 14
+
+  publish_nightly_release:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wezterm-windows-binaries-${{ github.sha }}
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          for f in *.exe wezterm-windows-binaries.zip; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
+      - name: Create or update nightly release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if ! gh release view nightly > /dev/null 2>&1; then
+            gh release create nightly \
+              --title "Nightly Build" \
+              --notes "Automated Windows binaries from the latest main branch push." \
+              --prerelease
+          fi
+
+          gh release upload --clobber nightly \
+            *.exe \
+            wezterm-windows-binaries.zip \
+            *.sha256
