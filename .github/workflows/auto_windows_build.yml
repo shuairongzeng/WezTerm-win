@@ -1,0 +1,74 @@
+name: auto_windows_build
+
+on:
+  push:
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.lock"
+      - "**/Cargo.toml"
+      - ".cargo/config.toml"
+      - "assets/fonts/**/*"
+      - "assets/icon/*"
+      - "assets/windows/**/*"
+      - "ci/deploy.sh"
+      - "ci/windows-installer.iss"
+      - "build-wezterm.ps1"
+      - ".github/workflows/auto_windows_build.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: auto-windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTUP_WINDOWS_PATH_ADD_BIN: "1"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Build release binaries
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+
+      - name: Prepare artifact files
+        shell: pwsh
+        run: |
+          New-Item -Path dist -ItemType Directory -Force | Out-Null
+          $bins = @(
+            "wezterm.exe",
+            "wezterm-gui.exe",
+            "wezterm-mux-server.exe",
+            "strip-ansi-escapes.exe"
+          )
+
+          foreach ($bin in $bins) {
+            Copy-Item "target/release/$bin" "dist/$bin" -Force
+          }
+
+          Compress-Archive -Path dist/* -DestinationPath wezterm-windows-binaries.zip -Force
+
+      - name: Upload binaries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wezterm-windows-binaries-${{ github.sha }}
+          path: |
+            dist/*.exe
+            wezterm-windows-binaries.zip
+          retention-days: 14
