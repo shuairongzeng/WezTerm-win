@@ -362,33 +362,82 @@ impl super::TermWindow {
                     let tw_raw_modifiers = raw_modifiers;
 
                     let mut did_encode = false;
+                    // FC: Track WouldBlock so we can return false and let the caller
+                    // (key_event_impl) queue the key for retry via pending_input.
+                    let mut would_block = false;
                     if let Some(key_event) = key_event {
                         if let Some(encoded) = self.encode_win32_input(&pane, &key_event) {
                             if self.config.debug_key_events {
                                 log::info!("win32: Encoded input as {:?}", encoded);
                             }
-                            if let Err(e) = pane
+                            match pane
                                 .writer()
                                 .write_all(encoded.as_bytes())
                                 .context("sending win32-input-mode encoded data")
                             {
-                                log::error!("win32-input-mode write failed: {:?}", e);
+                                Ok(()) => {
+                                    did_encode = true;
+                                }
+                                Err(ref e)
+                                    if e.downcast_ref::<std::io::Error>()
+                                        .map(|io| {
+                                            io.kind() == std::io::ErrorKind::WouldBlock
+                                        })
+                                        .unwrap_or(false) =>
+                                {
+                                    // FC: WouldBlock - return false so key_event_impl
+                                    // queues the key for retry; do NOT set did_encode.
+                                    log::debug!(
+                                        "win32-input-mode write WouldBlock, will retry key"
+                                    );
+                                    would_block = true;
+                                }
+                                Err(e) => {
+                                    log::error!("win32-input-mode write failed: {:?}", e);
+                                    // Non-WouldBlock error: mark as handled to avoid
+                                    // duplicate send by the fallback path below.
+                                    did_encode = true;
+                                }
                             }
-                            did_encode = true;
                         } else if let Some(encoded) = self.encode_kitty_input(&pane, &key_event) {
                             if self.config.debug_key_events {
                                 log::info!("kitty: Encoded input as {:?}", encoded);
                             }
-                            if let Err(e) = pane
+                            match pane
                                 .writer()
                                 .write_all(encoded.as_bytes())
                                 .context("sending kitty encoded data")
                             {
-                                log::error!("kitty-input-mode write failed: {:?}", e);
+                                Ok(()) => {
+                                    did_encode = true;
+                                }
+                                Err(ref e)
+                                    if e.downcast_ref::<std::io::Error>()
+                                        .map(|io| {
+                                            io.kind() == std::io::ErrorKind::WouldBlock
+                                        })
+                                        .unwrap_or(false) =>
+                                {
+                                    // FC: WouldBlock - return false so key_event_impl retries.
+                                    log::debug!(
+                                        "kitty-input-mode write WouldBlock, will retry key"
+                                    );
+                                    would_block = true;
+                                }
+                                Err(e) => {
+                                    log::error!("kitty-input-mode write failed: {:?}", e);
+                                    did_encode = true;
+                                }
                             }
-                            did_encode = true;
                         }
                     };
+
+                    // FC: If WouldBlock occurred, return false so that key_event_impl sees
+                    // the key as unhandled and enqueues it via queue_input_op for retry.
+                    if would_block {
+                        return false;
+                    }
+
                     if !did_encode {
                         if self.config.debug_key_events {
                             log::info!(

@@ -57,7 +57,7 @@ use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList, VecDeque};
 use std::ops::Add;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
@@ -1743,6 +1743,7 @@ impl TermWindow {
         window: &Window,
         mux_window_id: MuxWindowId,
         dead: &Arc<AtomicBool>,
+        window_miss_count: &Arc<AtomicUsize>,
     ) -> bool {
         if dead.load(Ordering::Relaxed) {
             // Subscription cancelled asynchronously
@@ -1773,14 +1774,29 @@ impl TermWindow {
                 // will then do the check with full context.
                 let mux = Mux::get();
                 if mux.get_window(mux_window_id).is_none() {
-                    // Something inconsistent: cancel subscription
+                    // FA: Previously this returned false immediately, permanently removing the
+                    // subscriber. Now we use a miss counter: only unsubscribe after 10
+                    // consecutive misses to tolerate transient races (workspace switch, RwLock
+                    // contention, etc.) that could cause a temporary None.
+                    // Symptom fixed: pane UI freeze that required full restart to recover.
+                    let miss = window_miss_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if miss >= 10 {
+                        log::warn!(
+                            "PaneOutput: mux_window_id={} not found {} times in a row, \
+                             cancelling mux subscription",
+                            mux_window_id, miss
+                        );
+                        return false;
+                    }
                     log::debug!(
-                        "PaneOutput: wanted mux_window_id={} from mux, but \
-                         was not found, cancel mux subscription",
-                        mux_window_id
+                        "PaneOutput: mux_window_id={} temporarily not found (miss #{}), \
+                         keeping subscription alive",
+                        mux_window_id, miss
                     );
-                    return false;
+                    return true;
                 }
+                // Window found: reset the miss counter
+                window_miss_count.store(0, Ordering::Relaxed);
                 let _ = pane_id;
             }
             MuxNotification::PaneAdded(_pane_id) => {
@@ -1842,6 +1858,9 @@ impl TermWindow {
         let mux_window_id = Arc::clone(&self.mux_window_id_for_subscriptions);
         let mux = Mux::get();
         let dead = Arc::new(AtomicBool::new(false));
+        // FA: Counter to tolerate transient mux.get_window() misses without
+        // permanently removing the subscriber (which would freeze the UI).
+        let window_miss_count = Arc::new(AtomicUsize::new(0));
         mux.subscribe(move |n| {
             if dead.load(Ordering::Relaxed) {
                 return false;
@@ -1849,8 +1868,15 @@ impl TermWindow {
             let mux_window_id = *mux_window_id.lock().unwrap();
             let window = window.clone();
             let dead = dead.clone();
+            let window_miss_count = window_miss_count.clone();
             promise::spawn::spawn_into_main_thread(async move {
-                Self::mux_pane_output_event_callback(n, &window, mux_window_id, &dead)
+                Self::mux_pane_output_event_callback(
+                    n,
+                    &window,
+                    mux_window_id,
+                    &dead,
+                    &window_miss_count,
+                )
             })
             .detach();
             true

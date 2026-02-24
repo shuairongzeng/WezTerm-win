@@ -407,9 +407,10 @@ impl Pane for LocalPane {
         if actions.len() <= BATCH_SIZE {
             // Small batch, process directly but still check for pending input
             if self.input_pending.load(Ordering::Acquire) {
-                // F09: Reduced from 1ms to 100us to minimize output latency
+                // FB: Increased from 100us to 500us to give key_down() more time
+                // to acquire the terminal lock, reducing PaneOutput notification delay.
                 std::thread::yield_now();
-                std::thread::sleep(Duration::from_micros(100));
+                std::thread::sleep(Duration::from_micros(500));
             }
             self.terminal.lock().perform_actions(actions);
         } else {
@@ -418,11 +419,10 @@ impl Pane for LocalPane {
             for chunk in actions.chunks(BATCH_SIZE) {
                 // Check if input is pending before acquiring lock
                 if self.input_pending.load(Ordering::Acquire) {
-                    // F09: Reduced from 2ms to 200us -- still enough for the GUI
-                    // thread to acquire the terminal lock, but avoids ~40ms cumulative
-                    // delay when processing 1000+ actions with input pending.
+                    // FB: Increased from 200us to 500us to give key_down() more time
+                    // to acquire the terminal lock when there is heavy output.
                     std::thread::yield_now();
-                    std::thread::sleep(Duration::from_micros(200));
+                    std::thread::sleep(Duration::from_micros(500));
                     consecutive_batches = 0;
                 }
 
