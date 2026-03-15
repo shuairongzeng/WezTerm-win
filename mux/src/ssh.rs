@@ -757,7 +757,7 @@ impl Domain for RemoteSshDomain {
         // eg: tmux integration to be tunnelled via the remote
         // session without duplicating a lot of logic over here.
 
-        let writer = WriterWrapper::new(writer);
+        let writer = WriterWrapper::new(writer, pane_id);
 
         let terminal = wezterm_term::Terminal::new(
             size,

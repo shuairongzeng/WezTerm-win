@@ -7,9 +7,10 @@ use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
-#[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use crossbeam::channel::{
+    bounded as crossbeam_bounded, Receiver as CrossbeamReceiver, SendError,
+    Sender as CrossbeamSender,
+};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -19,9 +20,7 @@ use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
-use std::io::{Read, Write};
-#[cfg(windows)]
-use std::os::raw::c_int;
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
@@ -30,8 +29,6 @@ use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
 use wezterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
-#[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
 pub mod activity;
 pub mod client;
@@ -148,14 +145,19 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: V
     histogram!("send_actions_to_mux.rate").record(1.);
 }
 
-fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: FileDescriptor) {
+fn parse_buffered_data(
+    pane: Weak<dyn Pane>,
+    dead: &Arc<AtomicBool>,
+    rx: CrossbeamReceiver<Vec<u8>>,
+) {
     let pane_id = pane.upgrade().map(|p| p.pane_id()).unwrap_or(0);
+    let start_time = Instant::now();
     log::info!(
-        "parse_buffered_data: starting parser thread for pane {}",
-        pane_id
+        "parse_buffered_data: starting parser thread for pane {} at {:?}",
+        pane_id,
+        start_time
     );
 
-    let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![];
     let mut hold = false;
@@ -164,27 +166,28 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
     let mut deadline = None;
 
     loop {
-        match rx.read(&mut buf) {
-            Ok(size) if size == 0 => {
-                log::info!("parse_buffered_data: EOF on rx for pane {}", pane_id);
-                // Don't set dead = true here! Let the caller check parser_needs_recovery
-                // and decide whether to recover or exit. Setting dead here would cause
-                // the main loop to exit before it can check parser_needs_recovery.
-                break;
-            }
-            Err(err) => {
-                log::error!(
-                    "parse_buffered_data: rx read error for pane {}: {:?}",
+        match rx.recv() {
+            Err(_) => {
+                // Channel disconnected = sender dropped = EOF
+                log::info!(
+                    "parse_buffered_data: channel disconnected for pane {} (ran for {:?})",
                     pane_id,
-                    err
+                    start_time.elapsed()
                 );
-                // Don't set dead = true here! Let the caller check parser_needs_recovery
-                // and decide whether to recover or exit. Setting dead here would cause
-                // the main loop to exit before it can check parser_needs_recovery.
                 break;
             }
-            Ok(size) => {
-                parser.parse(&buf[0..size], |action| {
+            Ok(data) if data.is_empty() => {
+                // Empty Vec = explicit EOF signal
+                log::info!(
+                    "parse_buffered_data: EOF signal for pane {} (ran for {:?})",
+                    pane_id,
+                    start_time.elapsed()
+                );
+                break;
+            }
+            Ok(data) => {
+                let size = data.len();
+                parser.parse(&data, |action| {
                     let mut flush = false;
                     match &action {
                         Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -222,8 +225,16 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                     // If we haven't accumulated too much data,
                     // pause for a short while to increase the chances
                     // that we coalesce a full "frame" from an unoptimized
-                    // TUI program
-                    if action_size < buf.len() {
+                    // TUI program.
+                    // IMPORTANT: Use an inner loop for coalescing so that
+                    // actions are always flushed before returning to the
+                    // blocking rx.recv() at the top. Unlike poll()+read()
+                    // on sockets, recv_timeout() consumes the data, so we
+                    // must not `continue` back to the outer loop with
+                    // unflushed actions.
+                    let config = configuration();
+                    let buf_size = config.mux_output_parser_buffer_size;
+                    'coalesce: while action_size < buf_size {
                         let poll_delay = match deadline {
                             None => {
                                 deadline.replace(Instant::now() + delay);
@@ -231,31 +242,54 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                             }
                             Some(target) => target.checked_duration_since(Instant::now()),
                         };
-                        if poll_delay.is_some() {
-                            let mut pfd = [pollfd {
-                                fd: rx.as_socket_descriptor(),
-                                events: POLLIN,
-                                revents: 0,
-                            }];
-                            if let Ok(1) = poll(&mut pfd, poll_delay) {
-                                // We can read now without blocking, so accumulate
-                                // more data into actions
-                                continue;
+                        let Some(poll_delay) = poll_delay else {
+                            break 'coalesce;
+                        };
+                        match rx.recv_timeout(poll_delay) {
+                            Ok(more_data) if more_data.is_empty() => {
+                                // EOF signal - flush and exit
+                                send_actions_to_mux(
+                                    &pane,
+                                    &dead,
+                                    std::mem::take(&mut actions),
+                                );
+                                return;
                             }
-
-                            // Not readable in time: let the data we have flow into
-                            // the terminal model
+                            Ok(more_data) => {
+                                // More data available within coalesce window
+                                let more_size = more_data.len();
+                                parser.parse(&more_data, |action| {
+                                    action.append_to(&mut actions);
+                                });
+                                action_size += more_size;
+                                // Stay in inner loop to try coalescing more
+                                continue 'coalesce;
+                            }
+                            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                                // No more data within window - flush
+                                break 'coalesce;
+                            }
+                            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                                // Channel closed during coalesce
+                                send_actions_to_mux(
+                                    &pane,
+                                    &dead,
+                                    std::mem::take(&mut actions),
+                                );
+                                return;
+                            }
                         }
                     }
 
+                    // Always flush actions before returning to blocking rx.recv()
                     send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
                     deadline = None;
                     action_size = 0;
                 }
 
-                let config = configuration();
-                buf.resize(config.mux_output_parser_buffer_size, 0);
-                delay = Duration::from_millis(config.mux_output_parser_coalesce_delay_ms);
+                delay = Duration::from_millis(
+                    configuration().mux_output_parser_coalesce_delay_ms,
+                );
             }
         }
     }
@@ -269,36 +303,102 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
     }
 }
 
-fn set_socket_buffer(fd: &mut FileDescriptor, option: i32, size: usize) -> anyhow::Result<()> {
-    let size = size as c_int;
-    let socklen = std::mem::size_of_val(&size);
-    unsafe {
-        let res = libc::setsockopt(
-            fd.as_socket_descriptor(),
-            SOL_SOCKET,
-            option,
-            &size as *const c_int as *const _,
-            socklen as _,
-        );
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error()).context("setsockopt")
+/// Helper function for the reader recovery loop.
+/// Returns true if the reader disconnected (allowing another recovery attempt),
+/// false if we should break out of the main loop entirely.
+#[allow(clippy::too_many_arguments)]
+fn run_reader_loop(
+    pane: &Weak<dyn Pane>,
+    pane_id: PaneId,
+    parser_tx: &mut CrossbeamSender<Vec<u8>>,
+    dead: &mut Arc<AtomicBool>,
+    parser_needs_recovery: &Arc<AtomicBool>,
+    data_rx: &std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::ErrorKind>>,
+    _start_time: Instant,
+    #[cfg(windows)] recovery_count: &mut u32,
+    #[cfg(windows)] do_recovery: &mut dyn FnMut(
+        &mut CrossbeamSender<Vec<u8>>,
+        &mut Arc<AtomicBool>,
+        &Arc<AtomicBool>,
+        &Weak<dyn Pane>,
+        PaneId,
+        &mut u32,
+    ) -> bool,
+) -> bool {
+    loop {
+        if parser_needs_recovery.load(Ordering::Acquire) {
+            #[cfg(windows)]
+            {
+                if !do_recovery(parser_tx, dead, parser_needs_recovery, pane, pane_id, recovery_count) {
+                    return false;
+                }
+                continue;
+            }
+            #[cfg(not(windows))]
+            {
+                return false;
+            }
+        }
+
+        let timeout = Duration::from_millis(500);
+        match data_rx.recv_timeout(timeout) {
+            Ok(Ok(data)) if data.is_empty() => {
+                let _ = parser_tx.send(Vec::new());
+                return false;
+            }
+            Ok(Err(err_kind)) => {
+                log::warn!(
+                    "read_pty recovered reader error for pane {}: {:?}",
+                    pane_id,
+                    err_kind
+                );
+                let _ = parser_tx.send(Vec::new());
+                return false;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if dead.load(Ordering::Acquire) {
+                    return false;
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Reader disconnected again - allow another recovery attempt
+                return true;
+            }
+            Ok(Ok(data)) => {
+                let size = data.len();
+                histogram!("read_from_pane_pty.bytes.rate").record(size as f64);
+
+                if parser_needs_recovery.load(Ordering::Acquire) {
+                    #[cfg(windows)]
+                    {
+                        if !do_recovery(parser_tx, dead, parser_needs_recovery, pane, pane_id, recovery_count) {
+                            return false;
+                        }
+                        if let Err(SendError(_)) = parser_tx.send(data) {
+                            return false;
+                        }
+                        continue;
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        return false;
+                    }
+                }
+
+                if let Err(SendError(_)) = parser_tx.send(data) {
+                    #[cfg(windows)]
+                    {
+                        continue;
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        return false;
+                    }
+                }
+            }
         }
     }
-}
-
-fn allocate_socketpair() -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
-    let (mut tx, mut rx) = socketpair().context("socketpair")?;
-    // Log warnings instead of silently ignoring socket buffer errors
-    // On Windows, large buffer sizes may not be supported
-    if let Err(e) = set_socket_buffer(&mut tx, SO_SNDBUF, BUFSIZE).context("SO_SNDBUF") {
-        log::warn!("Failed to set socket send buffer size: {:#}", e);
-    }
-    if let Err(e) = set_socket_buffer(&mut rx, SO_RCVBUF, BUFSIZE).context("SO_RCVBUF") {
-        log::warn!("Failed to set socket receive buffer size: {:#}", e);
-    }
-    Ok((tx, rx))
 }
 
 /// This function is run in a separate thread; its purpose is to perform
@@ -310,16 +410,13 @@ fn read_from_pane_pty(
     banner: Option<String>,
     reader: Box<dyn std::io::Read + Send>,
 ) {
-    // F18: Removed pre-allocated buf - data now comes directly from channel
+    let start_time = Instant::now();
 
     // This is used to signal that an error occurred either in this thread,
     // or in the main mux thread.  If `true`, this thread will terminate.
-    // On Windows, this may be replaced with a new Arc when recovering from
-    // socket errors, so it needs to be mutable.
     let mut dead = Arc::new(AtomicBool::new(false));
 
     // Shared flag to signal that the parser has exited and needs recovery.
-    // This allows the reader loop to detect parser death even while blocked in read().
     let parser_needs_recovery = Arc::new(AtomicBool::new(false));
 
     let (pane_id, exit_behavior) = match pane.upgrade() {
@@ -327,41 +424,34 @@ fn read_from_pane_pty(
         None => return,
     };
 
-    let (mut tx, rx) = match allocate_socketpair() {
-        Ok(pair) => pair,
-        Err(err) => {
-            log::error!("read_from_pane_pty: Unable to allocate a socketpair: {err:#}");
-            localpane::emit_output_for_pane(
-                pane_id,
-                &format!(
-                    "⚠️  wezterm: read_from_pane_pty: \
-                    Unable to allocate a socketpair: {err:#}"
-                ),
-            );
-            return;
-        }
-    };
+    log::info!(
+        "read_from_pane_pty: starting for pane {} at {:?}",
+        pane_id,
+        start_time
+    );
+
+    // Create crossbeam bounded channel instead of socketpair.
+    // This eliminates TCP loopback (127.0.0.1) which was the root cause of
+    // silent pane death after ~8 hours on Windows due to TCP timeouts/resets.
+    let (mut parser_tx, parser_rx) = crossbeam_bounded::<Vec<u8>>(1024);
 
     // Use a channel to receive data from a dedicated reader thread.
-    // This allows us to do timed waits and check recovery flags without blocking forever.
     let (data_tx, data_rx) =
         std::sync::mpsc::sync_channel::<Result<Vec<u8>, std::io::ErrorKind>>(64);
 
     // Spawn a dedicated PTY reader thread that sends data through the channel
-    let pane_id_for_reader = pane_id; // Copy for the reader thread
+    let pane_id_for_reader = pane_id;
     std::thread::spawn(move || {
-        let mut reader = reader; // Move reader into this thread
+        let mut reader = reader;
         let mut local_buf = vec![0u8; BUFSIZE];
         loop {
             match reader.read(&mut local_buf) {
                 Ok(0) => {
-                    // EOF
                     let _ = data_tx.send(Ok(Vec::new()));
                     break;
                 }
                 Ok(size) => {
                     if data_tx.send(Ok(local_buf[..size].to_vec())).is_err() {
-                        // Channel closed, exit
                         break;
                     }
                 }
@@ -377,14 +467,14 @@ fn read_from_pane_pty(
         );
     });
 
+    // Spawn parser thread using crossbeam channel
     std::thread::spawn({
         let dead = Arc::clone(&dead);
         let pane = pane.clone();
         let parser_needs_recovery = Arc::clone(&parser_needs_recovery);
-        let pane_id_for_parser = pane_id; // Copy for the parser thread
+        let pane_id_for_parser = pane_id;
         move || {
-            parse_buffered_data(pane, &dead, rx);
-            // Signal that parser has exited - the main loop may need to recover
+            parse_buffered_data(pane, &dead, parser_rx);
             parser_needs_recovery.store(true, Ordering::Release);
             log::info!(
                 "parse_buffered_data: parser thread exited, recovery flag set for pane {}",
@@ -394,26 +484,40 @@ fn read_from_pane_pty(
     });
 
     if let Some(banner) = banner {
-        tx.write_all(banner.as_bytes()).ok();
+        let _ = parser_tx.send(banner.into_bytes());
     }
 
-    // Recovery helper closure
+    // Recovery helper closure - now uses crossbeam channel instead of socketpair
     #[cfg(windows)]
-    let mut do_recovery = |tx: &mut FileDescriptor,
+    let mut recovery_count = 0u32;
+    #[cfg(windows)]
+    const MAX_PARSER_RECOVERIES: u32 = 5;
+
+    #[cfg(windows)]
+    let mut do_recovery = |parser_tx: &mut CrossbeamSender<Vec<u8>>,
                            dead: &mut Arc<AtomicBool>,
                            parser_needs_recovery: &Arc<AtomicBool>,
                            pane: &Weak<dyn Pane>,
-                           pane_id: PaneId|
+                           pane_id: PaneId,
+                           recovery_count: &mut u32|
      -> bool {
+        *recovery_count += 1;
         log::warn!(
-            "read_from_pane_pty: parser died for pane {}, attempting recovery",
-            pane_id
+            "read_from_pane_pty: parser died for pane {}, attempting recovery #{} (uptime: {:?})",
+            pane_id,
+            recovery_count,
+            start_time.elapsed()
         );
 
-        // F02: Check if pane is still alive before attempting recovery.
-        // If the pane has been removed from the mux, recovery would create
-        // a new parser thread that immediately fails pane.upgrade() and sets
-        // parser_needs_recovery again, causing an infinite recovery loop.
+        if *recovery_count > MAX_PARSER_RECOVERIES {
+            log::error!(
+                "read_from_pane_pty: parser recovery limit ({}) reached for pane {}",
+                MAX_PARSER_RECOVERIES,
+                pane_id
+            );
+            return false;
+        }
+
         if pane.upgrade().is_none() {
             log::error!(
                 "read_from_pane_pty: pane {} no longer exists, skipping recovery",
@@ -423,50 +527,56 @@ fn read_from_pane_pty(
             return false;
         }
 
-        match allocate_socketpair() {
-            Ok((new_tx, new_rx)) => {
-                *tx = new_tx;
-                let new_dead = Arc::new(AtomicBool::new(false));
-                *dead = new_dead;
-                parser_needs_recovery.store(false, Ordering::Release);
-                let pane_clone = pane.clone();
-                let dead_clone = Arc::clone(dead);
-                let recovery_clone = Arc::clone(parser_needs_recovery);
-                let pane_id_for_recovered = pane_id; // Copy for the recovered parser thread
-                std::thread::spawn(move || {
-                    parse_buffered_data(pane_clone, &dead_clone, new_rx);
-                    recovery_clone.store(true, Ordering::Release);
-                    log::info!("parse_buffered_data: recovered parser thread exited, recovery flag set for pane {}", pane_id_for_recovered);
-                });
-                log::info!("read_from_pane_pty: recovered parser for pane {}", pane_id);
-                true
-            }
-            Err(e) => {
-                log::error!(
-                    "read_from_pane_pty: failed to recover parser for pane {}: {:?}",
-                    pane_id,
-                    e
-                );
-                false
-            }
-        }
+        // Create new crossbeam channel (no more socketpair!)
+        let (new_tx, new_rx) = crossbeam_bounded::<Vec<u8>>(1024);
+        *parser_tx = new_tx;
+        let new_dead = Arc::new(AtomicBool::new(false));
+        *dead = new_dead;
+        parser_needs_recovery.store(false, Ordering::Release);
+
+        let pane_clone = pane.clone();
+        let dead_clone = Arc::clone(dead);
+        let recovery_clone = Arc::clone(parser_needs_recovery);
+        let pane_id_for_recovered = pane_id;
+        std::thread::spawn(move || {
+            parse_buffered_data(pane_clone, &dead_clone, new_rx);
+            recovery_clone.store(true, Ordering::Release);
+            log::info!(
+                "parse_buffered_data: recovered parser thread exited, recovery flag set for pane {}",
+                pane_id_for_recovered
+            );
+        });
+        log::info!(
+            "read_from_pane_pty: recovered parser for pane {} (recovery #{})",
+            pane_id,
+            recovery_count
+        );
+        true
     };
 
+    // PTY reader recovery tracking
+    let mut reader_recovery_count = 0u32;
+    const MAX_READER_RECOVERIES: u32 = 3;
+
     loop {
-        // Check if parser died and needs recovery FIRST, before checking dead flag.
-        // This ensures recovery gets a chance even if dead was set by send_actions_to_mux
-        // (when pane.upgrade() fails).
+        // Check if parser died and needs recovery FIRST
         if parser_needs_recovery.load(Ordering::Acquire) {
             #[cfg(windows)]
             {
-                if !do_recovery(&mut tx, &mut dead, &parser_needs_recovery, &pane, pane_id) {
+                if !do_recovery(
+                    &mut parser_tx,
+                    &mut dead,
+                    &parser_needs_recovery,
+                    &pane,
+                    pane_id,
+                    &mut recovery_count,
+                ) {
                     break;
                 }
                 continue;
             }
             #[cfg(not(windows))]
             {
-                // On non-Windows, parser death is usually fatal
                 log::error!(
                     "read_from_pane_pty: parser died for pane {}, exiting",
                     pane_id
@@ -475,40 +585,142 @@ fn read_from_pane_pty(
             }
         }
 
-        // Use recv_timeout so we can periodically check recovery flags
-        // even when no PTY output arrives
         let timeout = Duration::from_millis(500);
         match data_rx.recv_timeout(timeout) {
             Ok(Ok(data)) if data.is_empty() => {
                 // EOF from PTY
-                log::info!("read_pty EOF (shell exited normally): pane_id {}", pane_id);
+                log::info!(
+                    "read_pty EOF (shell exited normally): pane_id {} (uptime: {:?})",
+                    pane_id,
+                    start_time.elapsed()
+                );
+                // Send EOF signal to parser
+                let _ = parser_tx.send(Vec::new());
                 break;
             }
             Ok(Err(err_kind)) => {
-                // Error from PTY reader
-                log::warn!("read_pty reader error for pane {}: {:?}", pane_id, err_kind);
+                log::warn!(
+                    "read_pty reader error for pane {}: {:?} (uptime: {:?})",
+                    pane_id,
+                    err_kind,
+                    start_time.elapsed()
+                );
+                let _ = parser_tx.send(Vec::new());
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Timeout - check dead flag and loop back to check recovery flags
-                // We check dead here (after recovery check) so that recovery gets
-                // a chance to run even if dead was set by send_actions_to_mux
                 if dead.load(Ordering::Acquire) {
-                    // F12: Use Acquire paired with Release
                     log::info!(
-                        "read_from_pane_pty: dead flag set, exiting loop for pane {}",
-                        pane_id
+                        "read_from_pane_pty: dead flag set, exiting loop for pane {} (uptime: {:?})",
+                        pane_id,
+                        start_time.elapsed()
                     );
                     break;
                 }
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // Channel disconnected, reader thread exited
+                // PTY reader thread exited - check if child is still alive
                 log::info!(
-                    "read_from_pane_pty: data channel disconnected for pane {}",
-                    pane_id
+                    "read_from_pane_pty: data channel disconnected for pane {} (uptime: {:?})",
+                    pane_id,
+                    start_time.elapsed()
                 );
+
+                // Step 3: PTY Reader recovery
+                if reader_recovery_count < MAX_READER_RECOVERIES {
+                    if let Some(pane_ref) = pane.upgrade() {
+                        if !pane_ref.is_dead() {
+                            log::warn!(
+                                "PTY reader died but child still alive for pane {}, attempting reader recovery #{}",
+                                pane_id,
+                                reader_recovery_count + 1
+                            );
+                            match pane_ref.reader() {
+                                Ok(Some(new_reader)) => {
+                                    let (new_data_tx, new_data_rx) =
+                                        std::sync::mpsc::sync_channel::<
+                                            Result<Vec<u8>, std::io::ErrorKind>,
+                                        >(64);
+                                    // Replace data_rx - we need to shadow it
+                                    // Since data_rx is immutable in the match, we break and re-enter
+                                    let pane_id_for_new_reader = pane_id;
+                                    std::thread::spawn(move || {
+                                        let mut reader = new_reader;
+                                        let mut local_buf = vec![0u8; BUFSIZE];
+                                        loop {
+                                            match reader.read(&mut local_buf) {
+                                                Ok(0) => {
+                                                    let _ = new_data_tx.send(Ok(Vec::new()));
+                                                    break;
+                                                }
+                                                Ok(size) => {
+                                                    if new_data_tx
+                                                        .send(Ok(local_buf[..size].to_vec()))
+                                                        .is_err()
+                                                    {
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let _ = new_data_tx.send(Err(e.kind()));
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        log::info!(
+                                            "read_from_pane_pty: recovered PTY reader thread exited for pane {}",
+                                            pane_id_for_new_reader
+                                        );
+                                    });
+                                    reader_recovery_count += 1;
+                                    log::info!(
+                                        "PTY reader recovered for pane {} (recovery #{})",
+                                        pane_id,
+                                        reader_recovery_count
+                                    );
+                                    // We can't reassign data_rx in a match arm,
+                                    // so we run a nested loop with the new receiver
+                                    // and then break out when done
+                                    let nested_result = run_reader_loop(
+                                        &pane,
+                                        pane_id,
+                                        &mut parser_tx,
+                                        &mut dead,
+                                        &parser_needs_recovery,
+                                        &new_data_rx,
+                                        start_time,
+                                        #[cfg(windows)]
+                                        &mut recovery_count,
+                                        #[cfg(windows)]
+                                        &mut do_recovery,
+                                    );
+                                    if !nested_result {
+                                        break;
+                                    }
+                                    // If nested loop returned true, it means the reader
+                                    // disconnected again - continue outer loop for another
+                                    // recovery attempt
+                                    continue;
+                                }
+                                _ => {
+                                    log::error!(
+                                        "Failed to get new reader for pane {}",
+                                        pane_id
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    log::error!(
+                        "PTY reader recovery limit ({}) reached for pane {}",
+                        MAX_READER_RECOVERIES,
+                        pane_id
+                    );
+                }
+
+                let _ = parser_tx.send(Vec::new());
                 break;
             }
             Ok(Ok(data)) => {
@@ -516,21 +728,25 @@ fn read_from_pane_pty(
                 histogram!("read_from_pane_pty.bytes.rate").record(size as f64);
                 log::trace!("read_pty pane {pane_id} read {size} bytes");
 
-                // F18: Write data directly instead of copying through intermediate buf
-
-                // Check if parser died BEFORE attempting to write
+                // Check if parser died BEFORE attempting to send
                 if parser_needs_recovery.load(Ordering::Acquire) {
                     #[cfg(windows)]
                     {
-                        if !do_recovery(&mut tx, &mut dead, &parser_needs_recovery, &pane, pane_id)
-                        {
+                        if !do_recovery(
+                            &mut parser_tx,
+                            &mut dead,
+                            &parser_needs_recovery,
+                            &pane,
+                            pane_id,
+                            &mut recovery_count,
+                        ) {
                             break;
                         }
-                        // Write the current buffer to the new socket
-                        if let Err(e) = tx.write_all(&data) {
+                        // Send the current data to the new channel
+                        if let Err(SendError(_)) = parser_tx.send(data) {
                             error!(
-                                "read_pty failed to write data after recovery for pane {}: {:?}",
-                                pane_id, e
+                                "read_pty failed to send data after recovery for pane {}",
+                                pane_id
                             );
                             break;
                         }
@@ -546,44 +762,27 @@ fn read_from_pane_pty(
                     }
                 }
 
-                if let Err(err) = tx.write_all(&data) {
-                    // On Windows, socket connections can be abruptly reset.
+                // Send data through crossbeam channel instead of socketpair write
+                if let Err(SendError(_)) = parser_tx.send(data) {
+                    // Channel closed = parser thread exited
                     #[cfg(windows)]
                     {
-                        if let Some(code) = err.raw_os_error() {
-                            // 10053 = WSAECONNABORTED, 10054 = WSAECONNRESET
-                            if code == 10053 || code == 10054 {
-                                log::warn!(
-                                    "read_pty transient socket error for pane {}: os error {}, attempting to recover",
-                                    pane_id, code
-                                );
-                                if do_recovery(
-                                    &mut tx,
-                                    &mut dead,
-                                    &parser_needs_recovery,
-                                    &pane,
-                                    pane_id,
-                                ) {
-                                    // Write the current buffer to the new socket
-                                    if let Err(e) = tx.write_all(&data) {
-                                        error!(
-                                            "read_pty failed to write pending data after recovery for pane {}: {:?}",
-                                            pane_id, e
-                                        );
-                                        break;
-                                    }
-                                    continue;
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
+                        log::warn!(
+                            "read_pty channel send failed for pane {}, parser may have died",
+                            pane_id
+                        );
+                        // The parser_needs_recovery flag should be set soon;
+                        // loop back to check it
+                        continue;
                     }
-                    error!(
-                        "read_pty failed to write to parser: pane {} {:?}",
-                        pane_id, err
-                    );
-                    break;
+                    #[cfg(not(windows))]
+                    {
+                        error!(
+                            "read_pty failed to send to parser: pane {}",
+                            pane_id
+                        );
+                        break;
+                    }
                 }
             }
         }

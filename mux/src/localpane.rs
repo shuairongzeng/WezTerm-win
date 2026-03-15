@@ -330,13 +330,21 @@ impl Pane for LocalPane {
                         }
                         (ExitBehavior::Hold, _, true) => *proc = ProcessState::Dead,
                     }
-                    log::debug!("child terminated, new state is {:?}", proc);
+                    log::debug!(
+                        "child terminated for pane {}, new state is {:?}",
+                        self.pane_id,
+                        proc
+                    );
                 }
             }
             ProcessState::DeadPendingClose { killed } => {
                 if *killed {
                     *proc = ProcessState::Dead;
-                    log::debug!("child state -> {:?}", proc);
+                    log::debug!(
+                        "child state -> {:?} for pane {}",
+                        proc,
+                        self.pane_id
+                    );
                 }
             }
             ProcessState::Dead => {}

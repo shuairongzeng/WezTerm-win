@@ -24,6 +24,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use wezterm_term::TerminalSize;
 
 static DOMAIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
@@ -502,21 +503,35 @@ impl LocalDomain {
 pub(crate) struct WriterWrapper {
     sender: Sender<Vec<u8>>,
     /// Fallback for flush operations - we keep the writer reference
+    #[allow(dead_code)]
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Flag to indicate if the writer thread is still alive
     writer_alive: Arc<AtomicBool>,
+    /// Last successful write time for health monitoring
+    #[allow(dead_code)]
+    last_write_success: Arc<Mutex<Instant>>,
+    /// Pane ID for diagnostic logging
+    #[allow(dead_code)]
+    pane_id: PaneId,
 }
 
 impl WriterWrapper {
-    pub fn new(writer: Box<dyn Write + Send>) -> Self {
+    pub fn new(writer: Box<dyn Write + Send>, pane_id: PaneId) -> Self {
         let writer_arc = Arc::new(Mutex::new(writer));
         let writer_clone = Arc::clone(&writer_arc);
         let writer_alive = Arc::new(AtomicBool::new(true));
         let writer_alive_clone = Arc::clone(&writer_alive);
+        let last_write_success = Arc::new(Mutex::new(Instant::now()));
+        let last_write_success_clone = Arc::clone(&last_write_success);
 
         // Create a bounded channel with larger capacity to handle heavy bidirectional traffic
-        // 2048 allows more buffering during output bursts without blocking input
         let (sender, receiver) = bounded::<Vec<u8>>(2048);
+
+        let start_time = Instant::now();
+        log::info!(
+            "WriterWrapper: created for pane {} with channel capacity 2048",
+            pane_id
+        );
 
         // Spawn a background thread to handle writes
         std::thread::spawn(move || {
@@ -524,32 +539,54 @@ impl WriterWrapper {
                 let mut w = writer_clone.lock();
                 if let Err(e) = w.write_all(&data) {
                     log::error!(
-                        "WriterWrapper: write failed: {:?}, stopping writer thread",
-                        e
+                        "WriterWrapper: write failed for pane {}: {:?} (uptime: {:?})",
+                        pane_id,
+                        e,
+                        start_time.elapsed()
                     );
                     writer_alive_clone.store(false, Ordering::Release);
                     break;
                 }
                 // Flush after each write to ensure data is sent immediately
-                // This is important for interactive input
                 if let Err(e) = w.flush() {
                     log::error!(
-                        "WriterWrapper: flush failed: {:?}, stopping writer thread",
-                        e
+                        "WriterWrapper: flush failed for pane {}: {:?} (uptime: {:?})",
+                        pane_id,
+                        e,
+                        start_time.elapsed()
                     );
                     writer_alive_clone.store(false, Ordering::Release);
                     break;
                 }
+                *last_write_success_clone.lock() = Instant::now();
             }
             writer_alive_clone.store(false, Ordering::Release);
-            log::info!("WriterWrapper: writer thread exiting");
+            log::info!(
+                "WriterWrapper: writer thread exiting for pane {} (uptime: {:?})",
+                pane_id,
+                start_time.elapsed()
+            );
         });
 
         Self {
             sender,
             writer: writer_arc,
             writer_alive,
+            last_write_success,
+            pane_id,
         }
+    }
+
+    /// Check if the writer thread is still healthy
+    #[allow(dead_code)]
+    pub fn is_healthy(&self) -> bool {
+        self.writer_alive.load(Ordering::Acquire)
+    }
+
+    /// Get the last successful write time
+    #[allow(dead_code)]
+    pub fn last_write_time(&self) -> Instant {
+        *self.last_write_success.lock()
     }
 }
 
@@ -722,7 +759,7 @@ impl Domain for LocalDomain {
             self.name
         );
         let child_result = pair.slave.spawn_command(cmd);
-        let mut writer = WriterWrapper::new(pair.master.take_writer()?);
+        let mut writer = WriterWrapper::new(pair.master.take_writer()?, pane_id);
 
         let mut terminal = wezterm_term::Terminal::new(
             size,

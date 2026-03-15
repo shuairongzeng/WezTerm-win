@@ -197,7 +197,7 @@ impl TmuxDomainState {
             master_pane: ref_pane,
         };
 
-        let writer = WriterWrapper::new(pane_pty.take_writer()?);
+        let writer = WriterWrapper::new(pane_pty.take_writer()?, local_pane_id);
 
         let size = TerminalSize {
             rows: pane.pane_height as usize,
