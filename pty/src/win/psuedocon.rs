@@ -85,8 +85,7 @@ impl PsuedoCon {
                 size,
                 input.as_raw_handle() as _,
                 output.as_raw_handle() as _,
-                PSUEDOCONSOLE_INHERIT_CURSOR
-                    | PSEUDOCONSOLE_RESIZE_QUIRK
+                PSEUDOCONSOLE_RESIZE_QUIRK
                     | PSEUDOCONSOLE_WIN32_INPUT_MODE,
                 &mut con,
             )
@@ -114,16 +113,15 @@ impl PsuedoCon {
     pub fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<WinChild> {
         let mut si: STARTUPINFOEXW = unsafe { mem::zeroed() };
         si.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
-        // Explicitly set the stdio handles as invalid handles otherwise
-        // we can end up with a weird state where the spawned process can
-        // inherit the explicitly redirected output handles from its parent.
-        // For example, when daemonizing wezterm-mux-server, the stdio handles
-        // are redirected to a log file and the spawned process would end up
-        // writing its output there instead of to the pty we just created.
+        // Explicitly set the stdio handles to prevent the spawned process from
+        // inheriting redirected output handles from its parent (e.g. when
+        // daemonizing wezterm-mux-server with stdio redirected to a log file).
+        // Use null_mut() instead of INVALID_HANDLE_VALUE because .NET (pwsh.exe)
+        // treats INVALID_HANDLE_VALUE as a valid-but-broken handle.
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-        si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
-        si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+        si.StartupInfo.hStdInput = ptr::null_mut();
+        si.StartupInfo.hStdOutput = ptr::null_mut();
+        si.StartupInfo.hStdError = ptr::null_mut();
 
         let mut attrs = ProcThreadAttributeList::with_capacity(1)?;
         attrs.set_pty(self.con)?;

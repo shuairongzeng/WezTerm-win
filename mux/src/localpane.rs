@@ -340,11 +340,7 @@ impl Pane for LocalPane {
             ProcessState::DeadPendingClose { killed } => {
                 if *killed {
                     *proc = ProcessState::Dead;
-                    log::debug!(
-                        "child state -> {:?} for pane {}",
-                        proc,
-                        self.pane_id
-                    );
+                    log::debug!("child state -> {:?} for pane {}", proc, self.pane_id);
                 }
             }
             ProcessState::Dead => {}

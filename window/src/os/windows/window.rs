@@ -44,7 +44,7 @@ use winapi::um::sysinfoapi::{GetTickCount, GetVersionExW};
 use winapi::um::uxtheme::{
     CloseThemeData, GetThemeFont, GetThemeSysFont, OpenThemeData, SetWindowTheme,
 };
-use winapi::um::wingdi::{LOGFONTW, MAKEPOINTS};
+use winapi::um::wingdi::{BLACK_BRUSH, GetStockObject, LOGFONTW, MAKEPOINTS};
 use winapi::um::winnt::OSVERSIONINFOW;
 use winapi::um::winuser::*;
 use windows::UI::Color as WUIColor;
@@ -129,6 +129,9 @@ pub(crate) struct WindowInner {
     /// Timestamp when paint_throttled was set to true
     paint_throttled_at: Option<std::time::Instant>,
     invalidated: bool,
+    /// Whether the first OpenGL frame has been rendered.
+    /// Used to fill window with black before first real paint to prevent white flash.
+    first_paint_done: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -433,7 +436,7 @@ impl Window {
             // The ID is defined in assets/windows/resource.rc
             hIcon: unsafe { LoadIconW(h_inst, MAKEINTRESOURCEW(0x101)) },
             hCursor: null_mut(),
-            hbrBackground: null_mut(),
+            hbrBackground: unsafe { GetStockObject(BLACK_BRUSH as i32) } as HBRUSH,
             lpszMenuName: null(),
             lpszClassName: class_name.as_ptr(),
         };
@@ -550,6 +553,7 @@ impl Window {
             paint_throttled: false,
             paint_throttled_at: None,
             invalidated: true,
+            first_paint_done: false,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -1652,12 +1656,18 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
         rgbReserved: [0; 32],
     };
     let _ = BeginPaint(hwnd, &mut ps);
-    // Do nothing right now
+    // If the first OpenGL frame hasn't been rendered yet, fill the window
+    // with black to prevent white flash during startup
+    if !inner.first_paint_done {
+        FillRect(ps.hdc, &ps.rcPaint, GetStockObject(BLACK_BRUSH as i32) as HBRUSH);
+    }
     EndPaint(hwnd, &mut ps);
 
     inner.invalidated = false;
     // Ask the app to repaint in a bit
     inner.events.dispatch(WindowEvent::NeedRepaint);
+    // Mark first paint as done after dispatching NeedRepaint
+    inner.first_paint_done = true;
 
     inner.paint_throttled = true;
     inner.paint_throttled_at = Some(std::time::Instant::now());

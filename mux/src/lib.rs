@@ -6,11 +6,11 @@ use crate::window::{Window, WindowId};
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
-use domain::{Domain, DomainId, DomainState, SplitSource};
 use crossbeam::channel::{
     bounded as crossbeam_bounded, Receiver as CrossbeamReceiver, SendError,
     Sender as CrossbeamSender,
 };
+use domain::{Domain, DomainId, DomainState, SplitSource};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -100,6 +100,7 @@ pub struct Mux {
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, Arc<dyn Pane>>>,
     windows: RwLock<HashMap<WindowId, Window>>,
+    prune_dead_windows_retry_scheduled: AtomicBool,
     default_domain: RwLock<Option<Arc<dyn Domain>>>,
     domains: RwLock<HashMap<DomainId, Arc<dyn Domain>>>,
     domains_by_name: RwLock<HashMap<String, Arc<dyn Domain>>>,
@@ -248,11 +249,7 @@ fn parse_buffered_data(
                         match rx.recv_timeout(poll_delay) {
                             Ok(more_data) if more_data.is_empty() => {
                                 // EOF signal - flush and exit
-                                send_actions_to_mux(
-                                    &pane,
-                                    &dead,
-                                    std::mem::take(&mut actions),
-                                );
+                                send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
                                 return;
                             }
                             Ok(more_data) => {
@@ -271,11 +268,7 @@ fn parse_buffered_data(
                             }
                             Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
                                 // Channel closed during coalesce
-                                send_actions_to_mux(
-                                    &pane,
-                                    &dead,
-                                    std::mem::take(&mut actions),
-                                );
+                                send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
                                 return;
                             }
                         }
@@ -287,9 +280,7 @@ fn parse_buffered_data(
                     action_size = 0;
                 }
 
-                delay = Duration::from_millis(
-                    configuration().mux_output_parser_coalesce_delay_ms,
-                );
+                delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
             }
         }
     }
@@ -329,7 +320,14 @@ fn run_reader_loop(
         if parser_needs_recovery.load(Ordering::Acquire) {
             #[cfg(windows)]
             {
-                if !do_recovery(parser_tx, dead, parser_needs_recovery, pane, pane_id, recovery_count) {
+                if !do_recovery(
+                    parser_tx,
+                    dead,
+                    parser_needs_recovery,
+                    pane,
+                    pane_id,
+                    recovery_count,
+                ) {
                     return false;
                 }
                 continue;
@@ -372,7 +370,14 @@ fn run_reader_loop(
                 if parser_needs_recovery.load(Ordering::Acquire) {
                     #[cfg(windows)]
                     {
-                        if !do_recovery(parser_tx, dead, parser_needs_recovery, pane, pane_id, recovery_count) {
+                        if !do_recovery(
+                            parser_tx,
+                            dead,
+                            parser_needs_recovery,
+                            pane,
+                            pane_id,
+                            recovery_count,
+                        ) {
                             return false;
                         }
                         if let Err(SendError(_)) = parser_tx.send(data) {
@@ -704,10 +709,7 @@ fn read_from_pane_pty(
                                     continue;
                                 }
                                 _ => {
-                                    log::error!(
-                                        "Failed to get new reader for pane {}",
-                                        pane_id
-                                    );
+                                    log::error!("Failed to get new reader for pane {}", pane_id);
                                 }
                             }
                         }
@@ -777,10 +779,7 @@ fn read_from_pane_pty(
                     }
                     #[cfg(not(windows))]
                     {
-                        error!(
-                            "read_pty failed to send to parser: pane {}",
-                            pane_id
-                        );
+                        error!("read_pty failed to send to parser: pane {}", pane_id);
                         break;
                     }
                 }
@@ -886,6 +885,7 @@ impl Mux {
             tabs: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
             windows: RwLock::new(HashMap::new()),
+            prune_dead_windows_retry_scheduled: AtomicBool::new(false),
             default_domain: RwLock::new(default_domain),
             domains_by_name: RwLock::new(domains_by_name),
             domains: RwLock::new(domains),
@@ -1342,8 +1342,46 @@ impl Mux {
         tab
     }
 
+    fn schedule_prune_dead_windows_retry(&self, reason: &'static str) {
+        let Some(mux) = Mux::try_get() else {
+            log::trace!(
+                "prune_dead_windows: unable to schedule retry because mux is gone ({reason})"
+            );
+            return;
+        };
+
+        if !std::ptr::eq(self, Arc::as_ptr(&mux)) {
+            log::trace!(
+                "prune_dead_windows: skipping retry because mux instance is no longer current ({reason})"
+            );
+            return;
+        }
+
+        if mux
+            .prune_dead_windows_retry_scheduled
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            log::trace!("prune_dead_windows: retry already scheduled ({reason})");
+            return;
+        }
+
+        log::trace!("prune_dead_windows: scheduling retry ({reason})");
+        promise::spawn::spawn_into_main_thread(async move {
+            // Clear the flag before retrying so that a subsequent
+            // lock-contention miss can schedule another retry.
+            mux.prune_dead_windows_retry_scheduled
+                .store(false, Ordering::SeqCst);
+            log::trace!("prune_dead_windows: running scheduled retry");
+            mux.prune_dead_windows();
+        })
+        .detach();
+    }
+
     pub fn prune_dead_windows(&self) {
         if Activity::count() > 0 {
+            // Activity::Drop already schedules another prune pass,
+            // so preserve that behavior and avoid stacking retries here.
             log::trace!("prune_dead_windows: Activity::count={}", Activity::count());
             return;
         }
@@ -1356,7 +1394,10 @@ impl Mux {
                 Some(w) => w,
                 None => {
                     // It's ok if our caller already locked it; we can prune later.
-                    log::trace!("prune_dead_windows: self.windows already borrowed");
+                    log::trace!(
+                        "prune_dead_windows: self.windows already borrowed; scheduling retry"
+                    );
+                    self.schedule_prune_dead_windows_retry("self.windows already borrowed");
                     return;
                 }
             };
@@ -1844,6 +1885,131 @@ impl Mux {
         }
 
         Ok((tab, pane, window_id))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use promise::spawn::SimpleExecutor;
+
+    lazy_static::lazy_static! {
+        static ref TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    }
+
+    #[test]
+    fn prune_dead_windows_removes_empty_window_immediately() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let window = Window::new(Some("test".to_string()), None);
+        let window_id = window.window_id();
+        mux.windows.write().insert(window_id, window);
+
+        assert_eq!(mux.iter_windows(), vec![window_id]);
+        mux.prune_dead_windows();
+
+        assert!(mux.iter_windows().is_empty());
+        assert!(!mux
+            .prune_dead_windows_retry_scheduled
+            .load(Ordering::SeqCst));
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn prune_dead_windows_retries_after_window_lock_contention() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        Mux::shutdown();
+
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let window = Window::new(Some("test".to_string()), None);
+        let window_id = window.window_id();
+        mux.windows.write().insert(window_id, window);
+
+        let windows = mux.windows.write();
+        mux.prune_dead_windows();
+        assert!(mux
+            .prune_dead_windows_retry_scheduled
+            .load(Ordering::SeqCst));
+        drop(windows);
+
+        assert_eq!(mux.iter_windows(), vec![window_id]);
+
+        executor.tick().expect("scheduled prune retry should run");
+
+        assert!(mux.iter_windows().is_empty());
+        assert!(!mux
+            .prune_dead_windows_retry_scheduled
+            .load(Ordering::SeqCst));
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn prune_dead_windows_coalesces_multiple_retries() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        Mux::shutdown();
+
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let window = Window::new(Some("test".to_string()), None);
+        let window_id = window.window_id();
+        mux.windows.write().insert(window_id, window);
+
+        let windows = mux.windows.write();
+        mux.prune_dead_windows();
+        mux.prune_dead_windows();
+        assert!(mux
+            .prune_dead_windows_retry_scheduled
+            .load(Ordering::SeqCst));
+        drop(windows);
+
+        executor.tick().expect("scheduled prune retry should run");
+
+        assert!(mux.iter_windows().is_empty());
+        assert!(!mux
+            .prune_dead_windows_retry_scheduled
+            .load(Ordering::SeqCst));
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn prune_dead_windows_activity_deferral_is_resolved_by_activity_drop() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        Mux::shutdown();
+
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let window = Window::new(Some("test".to_string()), None);
+        let window_id = window.window_id();
+        mux.windows.write().insert(window_id, window);
+
+        let activity = Activity::new();
+        mux.prune_dead_windows();
+        assert_eq!(mux.iter_windows(), vec![window_id]);
+        assert!(!mux
+            .prune_dead_windows_retry_scheduled
+            .load(Ordering::SeqCst));
+
+        drop(activity);
+
+        executor
+            .tick()
+            .expect("activity drop should schedule prune_dead_windows");
+
+        assert!(mux.iter_windows().is_empty());
+
+        Mux::shutdown();
     }
 }
 

@@ -1017,6 +1017,15 @@ impl TermWindow {
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
             myself.load_os_parameters();
+            // Pre-render the first frame before showing the window.
+            // This ensures the OpenGL front buffer has content (via SwapBuffers)
+            // before ShowWindow makes the window visible, preventing the DWM
+            // from briefly compositing an empty white surface.
+            if myself.webgpu.is_some() {
+                myself.do_paint_webgpu().ok();
+            } else {
+                myself.do_paint(&window);
+            }
             window.show();
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);

@@ -27,9 +27,9 @@ impl PtySystem for ConPtySystem {
 
         let master = ConPtyMasterPty {
             inner: Arc::new(Mutex::new(Inner {
+                writable: Some(stdin.write),
                 con,
                 readable: stdout.read,
-                writable: Some(stdin.write),
                 size,
             })),
         };
@@ -46,9 +46,16 @@ impl PtySystem for ConPtySystem {
 }
 
 struct Inner {
+    // Field order matters for Drop: Rust drops fields in declaration order.
+    // Microsoft ConPTY shutdown sequence requires:
+    //   1. Close stdin pipe (writable) - signal EOF to child process
+    //   2. ClosePseudoConsole (con) - send CTRL_CLOSE_EVENT to clients
+    //   3. Close stdout pipe (readable) - drain remaining output
+    // Wrong order causes child processes (e.g. pwsh.exe/.NET) to crash
+    // with FailFast (0x80131623) due to inconsistent handle state.
+    writable: Option<FileDescriptor>,
     con: PsuedoCon,
     readable: FileDescriptor,
-    writable: Option<FileDescriptor>,
     size: PtySize,
 }
 
