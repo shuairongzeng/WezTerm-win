@@ -520,6 +520,9 @@ fn read_from_pane_pty(
                 MAX_PARSER_RECOVERIES,
                 pane_id
             );
+            // Don't let the pane silently die. Trigger EOF to parser
+            // and let the normal cleanup path handle it.
+            let _ = parser_tx.send(Vec::new());
             return false;
         }
 
@@ -720,6 +723,9 @@ fn read_from_pane_pty(
                         MAX_READER_RECOVERIES,
                         pane_id
                     );
+                    // Send EOF to parser to trigger normal pane cleanup
+                    let _ = parser_tx.send(Vec::new());
+                    break;
                 }
 
                 let _ = parser_tx.send(Vec::new());
@@ -1200,6 +1206,36 @@ impl Mux {
     }
 
     pub fn shutdown() {
+        // Explicitly clean up all panes before dropping the MUX.
+        // This ensures child processes are signaled to terminate
+        // and have a chance to clean up before we destroy the Mux.
+        let pane_ids: Vec<PaneId> = {
+            let mux_guard = MUX.lock();
+            if let Some(mux) = mux_guard.as_ref() {
+                mux.panes.read().keys().copied().collect()
+            } else {
+                return;
+            }
+        };
+
+        for pane_id in pane_ids {
+            let pane = {
+                let mux_guard = MUX.lock();
+                if let Some(mux) = mux_guard.as_ref() {
+                    mux.get_pane(pane_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(pane) = pane {
+                pane.kill();
+            }
+        }
+
+        // Give processes a brief moment to react to kill signals
+        #[cfg(windows)]
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
         MUX.lock().take();
     }
 

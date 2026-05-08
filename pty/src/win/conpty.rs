@@ -82,6 +82,22 @@ impl Inner {
     }
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Microsoft ConPTY shutdown sequence:
+        // 1. Close stdin pipe first to signal EOF to child process.
+        //    This encourages the child to gracefully exit.
+        self.writable.take();
+        // 2. ClosePseudoConsole (handled by PsuedoCon::drop).
+        //    This sends CTRL_CLOSE_EVENT to client processes.
+        //    Must happen AFTER stdin is closed to avoid inconsistent
+        //    handle state that causes .NET FailFast (0x80131623).
+        // 3. stdout pipe (readable) is closed automatically after `con`
+        //    because `readable` is declared after `con` in the struct,
+        //    ensuring all remaining output is drained.
+    }
+}
+
 #[derive(Clone)]
 pub struct ConPtyMasterPty {
     inner: Arc<Mutex<Inner>>,

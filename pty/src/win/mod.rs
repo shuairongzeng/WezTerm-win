@@ -38,8 +38,11 @@ impl WinChild {
                 Ok(Some(ExitStatus::with_exit_code(status)))
             }
         } else {
-            // Log the error but return None to allow retry
-            // This can happen if the process handle becomes invalid
+            // Log the error but return None to allow retry.
+            // Note: we do NOT assume the process has exited even if the
+            // handle is invalid, because on Windows/ConPTY the handle
+            // state can be transiently inconsistent while the process
+            // is still alive (e.g. during REPL sessions).
             let err = IoError::last_os_error();
             log::warn!("GetExitCodeProcess failed: {:?}", err);
             Ok(None)
@@ -150,11 +153,25 @@ impl std::future::Future for WinChild {
 
                     let waker = cx.waker().clone();
                     std::thread::spawn(move || {
-                        let result = unsafe { WaitForSingleObject(handle.0 as _, INFINITE) };
-                        if result == WAIT_FAILED {
-                            log::warn!("WaitForSingleObject failed in poll(): {:?}", IoError::last_os_error());
+                        // Use a loop with a finite timeout so that we don't
+                        // leak a permanently blocked thread if the handle
+                        // becomes invalid, but also don't give up on long-
+                        // running processes like REPLs.
+                        const POLL_WAIT_MS: DWORD = 30000; // 30 seconds
+                        loop {
+                            let result = unsafe { WaitForSingleObject(handle.0 as _, POLL_WAIT_MS) };
+                            if result == WAIT_FAILED {
+                                log::warn!("WaitForSingleObject failed in poll(): {:?}", IoError::last_os_error());
+                                waker.wake();
+                                break;
+                            }
+                            if result != winapi::shared::winerror::WAIT_TIMEOUT {
+                                // Process exited
+                                waker.wake();
+                                break;
+                            }
+                            // Timeout: process still running. Continue waiting.
                         }
-                        waker.wake();
                     });
                 }
                 Poll::Pending

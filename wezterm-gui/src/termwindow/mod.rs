@@ -1812,7 +1812,11 @@ impl TermWindow {
                 // If some other client spawns a pane inside this window, this
                 // gives us an opportunity to attach it to the clipboard.
                 let mux = Mux::get();
-                return mux.get_window(mux_window_id).is_some();
+                let exists = mux.get_window(mux_window_id).is_some();
+                if exists {
+                    window_miss_count.store(0, Ordering::Relaxed);
+                }
+                return exists;
             }
             MuxNotification::TabAddedToWindow { window_id, .. }
             | MuxNotification::WindowTitleChanged { window_id, .. }
@@ -3624,6 +3628,18 @@ impl TermWindow {
         })
     }
 
+    /// Non-inserting access to pane state.
+    /// Returns None if no state exists for this pane.
+    pub fn try_pane_state(&self, pane_id: PaneId) -> Option<RefMut<'_, PaneState>> {
+        if self.pane_state.borrow().contains_key(&pane_id) {
+            Some(RefMut::map(self.pane_state.borrow_mut(), |state| {
+                state.get_mut(&pane_id).unwrap()
+            }))
+        } else {
+            None
+        }
+    }
+
     pub fn tab_state(&self, tab_id: TabId) -> RefMut<'_, TabState> {
         RefMut::map(self.tab_state.borrow_mut(), |state| {
             state.entry(tab_id).or_insert_with(TabState::default)
@@ -3660,7 +3676,7 @@ impl TermWindow {
     }
 
     pub fn get_viewport(&self, pane_id: PaneId) -> Option<StableRowIndex> {
-        self.pane_state(pane_id).viewport
+        self.try_pane_state(pane_id).and_then(|s| s.viewport)
     }
 
     pub fn set_viewport(

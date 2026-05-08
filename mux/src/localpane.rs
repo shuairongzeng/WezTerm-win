@@ -1237,6 +1237,14 @@ impl Drop for LocalPane {
         // <https://github.com/wezterm/wezterm/issues/558>
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
+            // On Windows, TerminateProcess is asynchronous. Give the child
+            // a brief window to actually terminate and release handles,
+            // otherwise OpenConsole.exe may linger and interfere with
+            // subsequent pane creation.
+            #[cfg(windows)]
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     }
 }
